@@ -1,0 +1,741 @@
+#!/usr/bin/env python3
+"""net.hadess.SensorProxy drop-in backed by the Qualcomm Sensor Core (SSC).
+
+Owns the SensorProxy D-Bus name that GNOME's gsd-power consumes for
+auto-brightness, and serves LightLevel from the ambient_light sensor on the
+ADSP over QMI/QRTR. Replaces iio-sensor-proxy on machines where the sensors
+live behind the SSC and no IIO device exists (Snapdragon X Elite laptops).
+
+Claim semantics match iio-sensor-proxy: the QMI subscription to the DSP is
+only active while at least one client holds ClaimLight(); claims are dropped
+automatically when the claiming client leaves the bus.
+
+Requires: the SSC registry populated at boot (sl7-sensors.service — run
+'sl7-sensors setup' once) and root (the D-Bus policy shipped by
+iio-sensor-proxy allows only root to own the name).
+
+With --controller it instead drives /sys/class/backlight directly (see
+/etc/default/sl7-sensor-proxy); disable GNOME's own auto-brightness first:
+gsettings set org.gnome.settings-daemon.plugins.power ambient-enabled false
+"""
+import glob
+import json
+import os
+import socket
+import struct
+import sys
+import threading
+
+import gi
+gi.require_version("Gio", "2.0")
+gi.require_version("GLib", "2.0")
+from gi.repository import Gio, GLib
+
+AF_QIPCRTR = 42
+SNS_SERVICE = 400
+SNS_CLIENT_REQ = 0x20
+SNS_CLIENT_REPORT_IND = 0x21
+SNS_CLIENT_JUMBO_IND = 0x22
+SUID_LOOKUP = (0xABABABABABABABAB, 0xABABABABABABABAB)
+SNS_SUID_MSGID_REQ = 512
+SNS_SUID_MSGID_EVENT = 768
+MSGID_STREAM_CONFIG = 513
+MSGID_SENSOR_EVENT = 1025
+
+# Preferred sources, in order. The surface color sensor reports FRACTIONAL
+# lux at up to 4 Hz (its first data field), while ambient_light rounds to
+# integer lux at max 1.33 Hz — in dim rooms that quantization is a huge
+# relative jitter.
+SENSOR_SOURCES = [("color", 4.0), ("ambient_light", 1.0)]
+
+# gsd-power's own controller is too twitchy for a laptop: a 1.6 s EWMA and a
+# linear lux->brightness map make the screen chase every passing shadow
+# (measured: a 4-lux wiggle = 15% backlight swing). So we pre-smooth the lux
+# we publish on D-Bus (gsd only uses RATIOS of LightLevel — it re-anchors its
+# norm whenever the user touches the brightness slider):
+#   - slow EMA (TAU_SLOW) so ambient drift moves brightness imperceptibly;
+#   - a sustained large deviation (FAST_TRIGGER for FAST_HOLD_S) switches to
+#     TAU_FAST so real lighting changes (lamp on/off) still respond quickly.
+# D-Bus carries the smoothed value as TRUE lux; the gamma compression below is
+# applied ONLY to the copy fed to our own --controller loop (see on_light).
+TAU_SLOW = 6.0          # s
+TAU_FAST = 1.5          # s
+FAST_TRIGGER = 0.3      # relative deviation of raw vs EMA
+FAST_HOLD_S = 1.5       # deviation must persist this long
+# --controller response curve only: gamma compression flattens the map (light
+# must change ~2.25x, not 1.5x, to traverse the anchor->100% range). No emit
+# gating anywhere — gsd's EWMA is event-driven and time-weighted, so a dense
+# stream of small steps ramps smoothly while sparse gated updates would land
+# as visible jumps; rounding alone dedupes true steady state.
+LUX_GAMMA = 0.5         # controller value = lux ** gamma
+EMIT_ROUND = 2          # decimals of the controller (compressed) value
+
+# --controller mode: drive /sys/class/backlight directly instead of relying
+# on gsd-power's auto-brightness (GNOME 50's controller is event-driven and
+# dual-anchored — it turns smooth input into visible jumps; disable it with
+#   gsettings set org.gnome.settings-daemon.plugins.power ambient-enabled false
+# when using this mode). Control law: brightness = K * ema_lux ** LUX_GAMMA,
+# where K is learned whenever the user sets brightness manually (slider,
+# keys — any external write we did not make) and persisted across restarts.
+CTRL_TICK_MS = 100          # ramp step interval
+CTRL_APPROACH = 0.15        # close this fraction of the gap per tick
+CTRL_RAMP_STEP = 0.02       # max fraction of full range per tick (~5 s 0-100%)
+CTRL_STOP_COUNTS = 2        # done when within this many raw counts of target
+CTRL_ADOPT_FRAC = 0.015     # external change bigger than this = user intent
+CTRL_MIN_FRAC = 0.02        # never go fully dark
+CTRL_USER_POLL_S = 1.0      # how often to look for external writes
+# Degenerate-input floor: below ~1 lux (compressed = lux**gamma), sensor data
+# carries no usable signal — near-zero noise would swing k and the target
+# wildly (observed with a stuck sensor: every slider correction re-anchored
+# against garbage, then the next wiggle yanked brightness away again).
+# Clamping the value used for anchoring AND targeting makes true darkness —
+# and a dead sensor — behave as plain manual control at the anchored level.
+CTRL_COMP_FLOOR = 1.0       # compressed-domain floor (== 1 lux at gamma 0.5)
+
+BUS_NAME = "net.hadess.SensorProxy"
+OBJ_PATH = "/net/hadess/SensorProxy"
+IFACE = "net.hadess.SensorProxy"
+
+INTROSPECTION = """
+<node>
+  <interface name='net.hadess.SensorProxy'>
+    <method name='ClaimLight'/>
+    <method name='ReleaseLight'/>
+    <method name='ClaimAccelerometer'/>
+    <method name='ReleaseAccelerometer'/>
+    <method name='ClaimProximity'/>
+    <method name='ReleaseProximity'/>
+    <property name='HasAccelerometer' type='b' access='read'/>
+    <property name='AccelerometerOrientation' type='s' access='read'/>
+    <property name='HasAmbientLight' type='b' access='read'/>
+    <property name='LightLevelUnit' type='s' access='read'/>
+    <property name='LightLevel' type='d' access='read'/>
+    <property name='HasProximity' type='b' access='read'/>
+    <property name='ProximityNear' type='b' access='read'/>
+  </interface>
+</node>
+"""
+
+
+# ---------- minimal protobuf + QMI (see read-sensor for the annotated
+# version; framing details in worklog 2026-07-20-sl7-als-bringup) ----------
+
+def varint(n):
+    out = b""
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out += bytes([b | (0x80 if n else 0)])
+        if not n:
+            return out
+
+
+def tag(field, wire):
+    return varint(field << 3 | wire)
+
+
+def pb_bytes(field, data):
+    return tag(field, 2) + varint(len(data)) + data
+
+
+def pb_varint(field, val):
+    return tag(field, 0) + varint(val)
+
+
+def pb_fixed32(field, val):
+    return tag(field, 5) + struct.pack("<I", val)
+
+
+def pb_fixed64(field, val):
+    return tag(field, 1) + struct.pack("<Q", val)
+
+
+def read_varint(buf, i):
+    val = shift = 0
+    while i < len(buf):
+        b = buf[i]
+        i += 1
+        val |= (b & 0x7F) << shift
+        if not b & 0x80:
+            return val, i
+        shift += 7
+    return val, i
+
+
+def pb_parse(buf):
+    out, i = {}, 0
+    while i < len(buf):
+        t, i = read_varint(buf, i)
+        f, w = t >> 3, t & 7
+        if w == 0:
+            v, i = read_varint(buf, i)
+        elif w == 1:
+            v, i = buf[i:i + 8], i + 8
+        elif w == 2:
+            ln, i = read_varint(buf, i)
+            v, i = buf[i:i + ln], i + ln
+        elif w == 5:
+            v, i = buf[i:i + 4], i + 4
+        else:
+            break
+        out.setdefault(f, []).append(v)
+    return out
+
+
+def qmi_encode(msg_id, txn, payload):
+    val = struct.pack("<H", len(payload)) + payload
+    body = b"\x01" + struct.pack("<H", len(val)) + val
+    return struct.pack("<BHHH", 0, txn, msg_id, len(body)) + body
+
+
+def qmi_decode(buf):
+    if len(buf) < 7:
+        return None, None, None, {}
+    mtype, txn, msg_id, _ = struct.unpack_from("<BHHH", buf, 0)
+    tlvs, i = {}, 7
+    while i + 3 <= len(buf):
+        t, ln = buf[i], struct.unpack_from("<H", buf, i + 1)[0]
+        tlvs[t] = buf[i + 3:i + 3 + ln]
+        i += 3 + ln
+    return mtype, txn, msg_id, tlvs
+
+
+def client_request(suid, msg_id, payload=b""):
+    suid_msg = pb_fixed64(1, suid[0]) + pb_fixed64(2, suid[1])
+    susp = pb_varint(1, 1) + pb_varint(2, 0)
+    req = pb_bytes(2, payload) if payload else b""
+    return (pb_bytes(1, suid_msg) + pb_fixed32(2, msg_id) +
+            pb_bytes(3, susp) + pb_bytes(4, req))
+
+
+def qmi_events(tlvs):
+    for e in pb_parse(tlvs[2][2:]).get(2, []):
+        inner = pb_parse(e)
+        if 1 not in inner:
+            continue
+        eid = struct.unpack("<I", inner[1][0])[0]
+        yield eid, inner[3][0] if 3 in inner else b""
+
+
+def find_service():
+    s = socket.socket(AF_QIPCRTR, socket.SOCK_DGRAM, 0)
+    s.settimeout(2.0)
+    s.sendto(struct.pack("<5I", 10, 0, 0, 0, 0), (1, 0xFFFFFFFE))
+    found = None
+    while True:
+        try:
+            data, _ = s.recvfrom(4096)
+        except socket.timeout:
+            break
+        if len(data) >= 20:
+            cmd, svc, _, node, port = struct.unpack_from("<5I", data, 0)
+            if cmd == 4 and svc == SNS_SERVICE:
+                found = (node, port)
+    s.close()
+    return found
+
+
+def lookup_suid(addr, data_type):
+    sock = socket.socket(AF_QIPCRTR, socket.SOCK_DGRAM, 0)
+    sock.settimeout(3.0)
+    try:
+        req = client_request(SUID_LOOKUP, SNS_SUID_MSGID_REQ,
+                             pb_bytes(1, data_type.encode()) + pb_varint(2, 0))
+        sock.sendto(qmi_encode(SNS_CLIENT_REQ, 1, req), addr)
+        deadline = GLib.get_monotonic_time() + 6_000_000
+        while GLib.get_monotonic_time() < deadline:
+            try:
+                data, _ = sock.recvfrom(65536)
+            except socket.timeout:
+                return None
+            _, _, mid, tlvs = qmi_decode(data)
+            if mid not in (SNS_CLIENT_REPORT_IND, SNS_CLIENT_JUMBO_IND) \
+                    or 2 not in tlvs:
+                continue
+            for eid, pay in qmi_events(tlvs):
+                if eid != SNS_SUID_MSGID_EVENT:
+                    continue
+                for sb in pb_parse(pay).get(2, []):
+                    su = pb_parse(sb)
+                    return (struct.unpack("<Q", su[1][0])[0],
+                            struct.unpack("<Q", su[2][0])[0])
+        return None
+    finally:
+        sock.close()
+
+
+class BacklightController:
+    """Owns the lux -> backlight loop when --controller is active."""
+
+    def __init__(self, proxy):
+        self.proxy = proxy
+        self.enabled = False
+        self.last_comp = None       # last compressed light value seen
+        bl = sorted(glob.glob("/sys/class/backlight/*"))
+        self.bl_path = bl[0] if bl else None
+        self.bl_max = int(self._read("max_brightness") or 0) if bl else 0
+        self.state_dir = os.environ.get("STATE_DIRECTORY",
+                                        os.path.expanduser("~/.local/state"))
+        self.state_file = os.path.join(self.state_dir, "anchor.json")
+        self.k = None               # anchor: brightness_frac / lux**gamma
+        self.target = None          # fraction we're steering toward
+        self.last_written = None    # raw value of our last write
+        self.writable = bool(self.bl_path) and os.access(
+            os.path.join(self.bl_path, "brightness"), os.W_OK)
+        self._load_state()
+
+    def _read(self, attr):
+        try:
+            with open(os.path.join(self.bl_path, attr)) as f:
+                return f.read().strip()
+        except OSError:
+            return None
+
+    def _load_state(self):
+        try:
+            with open(self.state_file) as f:
+                k = json.load(f)["k"]
+            # validate before adopting: a corrupt state file must not poison
+            # every subsequent on_light call
+            if isinstance(k, (int, float)) and 0 < k < 1e6 and k == k:
+                self.k = float(k)
+                print(f"controller: anchor k={self.k:.4f} loaded", flush=True)
+        except (OSError, KeyError, TypeError, ValueError):
+            # TypeError covers valid-JSON-wrong-shape (null, a list): this
+            # runs in __init__, so anything escaping restart-loops the unit
+            pass
+
+    def _save_state(self):
+        try:
+            os.makedirs(self.state_dir, exist_ok=True)
+            with open(self.state_file, "w") as f:
+                json.dump({"k": self.k}, f)
+        except OSError as e:
+            print(f"controller: state save failed: {e}", file=sys.stderr)
+
+    def start(self):
+        if not self.bl_path or not self.bl_max:
+            print("controller: no backlight device, disabled", file=sys.stderr)
+            return
+        if not self.writable:
+            print("controller: backlight not writable, DRY RUN", flush=True)
+        self.enabled = True
+        GLib.timeout_add(CTRL_TICK_MS, self._tick)
+        GLib.timeout_add(int(CTRL_USER_POLL_S * 1000), self._poll_user)
+
+    # Called on the main loop with the smoothed, gamma-compressed value.
+    def on_light(self, compressed):
+        compressed = max(compressed, CTRL_COMP_FLOOR)
+        self.last_comp = compressed
+        if self.k is None:
+            # First contact: adopt the current brightness for current light.
+            cur = int(self._read("brightness") or 0)
+            self.k = max(cur / self.bl_max, CTRL_MIN_FRAC) / compressed
+            self._save_state()
+            print(f"controller: initial anchor k={self.k:.4f}", flush=True)
+        self.target = min(1.0, max(CTRL_MIN_FRAC, self.k * compressed))
+
+    def _tick(self):
+        if self.target is None:
+            return True
+        cur = int(self._read("brightness") or 0)
+        # Someone else moved the backlight (slider, keys, idle dim): don't
+        # fight it — _poll_user will adopt it as the new anchor shortly.
+        if self.last_written is not None and abs(cur - self.last_written) > 1:
+            return True
+        # Exponential approach in raw counts: large gaps close fast (capped at
+        # CTRL_RAMP_STEP/tick), small gaps glide in 1-count steps — the largest
+        # possible visible increment is 1/4095, so drift can never look like a
+        # jump. A hold-until-threshold deadband here would re-quantize smooth
+        # drift into visible notches (measured: 60-count jumps once a second).
+        delta_counts = self.target * self.bl_max - cur
+        if abs(delta_counts) < CTRL_STOP_COUNTS:
+            return True
+        step = max(1.0, min(abs(delta_counts) * CTRL_APPROACH,
+                            CTRL_RAMP_STEP * self.bl_max))
+        val = cur + int(round(step)) * (1 if delta_counts > 0 else -1)
+        if val != cur:
+            if self.writable:
+                try:
+                    with open(os.path.join(self.bl_path, "brightness"), "w") as f:
+                        f.write(str(val))
+                except OSError as e:
+                    print(f"controller: write failed: {e}", file=sys.stderr)
+                    return True
+            else:
+                print(f"controller[dry]: {cur} -> {val}", flush=True)
+            self.last_written = val
+        return True
+
+    def _poll_user(self):
+        """Adopt external brightness writes (slider/keys) as the new anchor."""
+        if self.target is None:
+            return True
+        cur = int(self._read("brightness") or 0)
+        cur_frac = cur / self.bl_max
+        # Mid-ramp our own writes differ from target; only treat values that
+        # are neither our last write nor within the deadband of the target as
+        # a user decision.
+        if self.last_written is not None and abs(cur - self.last_written) <= 1:
+            return True
+        if abs(cur_frac - self.target) < CTRL_ADOPT_FRAC:
+            return True
+        # A write to 0 is the screen blanking (DPMS/lock), not a brightness
+        # choice — anchoring on it would slam k to the floor. Real "as dark
+        # as possible" intent still lands: the slider's minimum is above 0.
+        if cur == 0:
+            return True
+        compressed = self.last_comp
+        if compressed and compressed > 0:
+            self.k = max(cur_frac, CTRL_MIN_FRAC) / compressed
+            self.target = cur_frac
+            self.last_written = cur
+            self._save_state()
+            print(f"controller: user set {cur_frac:.0%}, "
+                  f"new anchor k={self.k:.4f}", flush=True)
+        return True
+
+
+class SensorProxy:
+    def __init__(self):
+        self.conn = None
+        self.reg_id = None
+        self.addr = None
+        self.suid = None
+        self.has_light = False
+        self.light_level = 0.0
+        self.rate_hz = 1.0
+        self.controller = None
+        self.claimers = {}          # sender -> (refcount, name watch id)
+        self.stream_stop = None
+        self.stream_thread = None
+
+    # --- D-Bus plumbing ---
+
+    def start(self, bus_type=Gio.BusType.SYSTEM):
+        Gio.bus_own_name(bus_type, BUS_NAME,
+                         Gio.BusNameOwnerFlags.NONE,
+                         self.on_bus_acquired, None, self.on_name_lost)
+
+    def on_bus_acquired(self, conn, name):
+        self.conn = conn
+        node = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION)
+        self.reg_id = conn.register_object(
+            OBJ_PATH, node.interfaces[0],
+            self.on_method_call, self.on_get_property, None)
+        threading.Thread(target=self.wait_for_sensor, daemon=True).start()
+
+    def on_name_lost(self, conn, name):
+        # Exit 5: matched by RestartPreventExitStatus in the unit so we don't
+        # restart-loop against another SensorProxy owning the name.
+        print(f"lost bus name {name} — is another sensor proxy running?",
+              file=sys.stderr)
+        sys.exit(5)
+
+    def on_get_property(self, conn, sender, path, iface, prop):
+        vals = {
+            "HasAccelerometer": GLib.Variant("b", False),
+            "AccelerometerOrientation": GLib.Variant("s", "undefined"),
+            "HasAmbientLight": GLib.Variant("b", self.has_light),
+            "LightLevelUnit": GLib.Variant("s", "lux"),
+            "LightLevel": GLib.Variant("d", self.light_level),
+            "HasProximity": GLib.Variant("b", False),
+            "ProximityNear": GLib.Variant("b", False),
+        }
+        return vals.get(prop)
+
+    def emit_changed(self, props):
+        self.conn.emit_signal(
+            None, OBJ_PATH, "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            GLib.Variant("(sa{sv}as)", (IFACE, props, [])))
+
+    def on_method_call(self, conn, sender, path, iface, method, params,
+                       invocation):
+        if method == "ClaimLight":
+            self.claim(sender)
+        elif method == "ReleaseLight":
+            self.release(sender)
+        # Accelerometer/Proximity claims are accepted as no-ops: we report
+        # Has*=False, but gsd should not error out if it calls them anyway.
+        invocation.return_value(None)
+
+    # --- claim tracking (main-loop thread only) ---
+
+    def claim(self, sender):
+        if sender in self.claimers:
+            refs, watch = self.claimers[sender]
+            self.claimers[sender] = (refs + 1, watch)
+            return
+        watch = Gio.bus_watch_name_on_connection(
+            self.conn, sender, Gio.BusNameWatcherFlags.NONE,
+            None, self.on_claimer_vanished)
+        self.claimers[sender] = (1, watch)
+        print(f"light claimed by {sender} ({len(self.claimers)} claimer(s))",
+              flush=True)
+        if len(self.claimers) == 1:
+            self.start_stream()
+
+    def release(self, sender):
+        if sender not in self.claimers:
+            return
+        refs, watch = self.claimers[sender]
+        if refs > 1:
+            self.claimers[sender] = (refs - 1, watch)
+            return
+        self.drop_claimer(sender, watch)
+
+    def on_claimer_vanished(self, conn, sender):
+        # Client left the bus entirely: drop it regardless of refcount.
+        if sender in self.claimers:
+            _, watch = self.claimers[sender]
+            self.drop_claimer(sender, watch)
+
+    def drop_claimer(self, sender, watch):
+        Gio.bus_unwatch_name(watch)
+        del self.claimers[sender]
+        print(f"light released by {sender} ({len(self.claimers)} claimer(s))",
+              flush=True)
+        if not self.claimers:
+            self.stop_stream()
+
+    # --- sensor side ---
+
+    def discover_sensor(self):
+        """find_service(), then pick the first available SENSOR_SOURCE.
+
+        Returns (name, addr, suid, rate_hz) on success, None if neither the
+        QMI service nor any configured sensor is present yet. Mutates no
+        shared state: a lingering old stream thread re-discovering must not
+        clobber the address a new thread is using.
+        """
+        addr = find_service()
+        if not addr:
+            return None
+        for cand, rate in SENSOR_SOURCES:
+            suid = lookup_suid(addr, cand)
+            if suid:
+                return cand, addr, suid, rate
+        return None
+
+    def wait_for_sensor(self):
+        """Poll until the SSC registry is populated (sl7-sensors attach)."""
+        name = None
+        warned = False
+        while not name:
+            found = None
+            try:
+                found = self.discover_sensor()
+            except Exception as e:
+                # e.g. no AF_QIPCRTR support on this kernel, or a malformed
+                # datagram mid-parse — keep serving HasAmbientLight=false
+                # and retry rather than dying silently.
+                if not warned:
+                    print(f"sensor discovery failed ({e!r}); retrying",
+                          file=sys.stderr)
+                    warned = True
+            if found:
+                name, self.addr, self.suid, self.rate_hz = found
+            else:
+                threading.Event().wait(5)
+        print(f"{name} found: suid={self.suid[0]:#x} {self.suid[1]:#x}, "
+              f"{self.rate_hz:g} Hz", flush=True)
+        GLib.idle_add(self.set_has_light)
+
+    def set_has_light(self):
+        self.has_light = True
+        self.emit_changed({"HasAmbientLight": GLib.Variant("b", True)})
+        # In controller mode the stream runs permanently; otherwise a client
+        # may have claimed before the sensor appeared.
+        if self.controller:
+            self.start_stream()
+            self.controller.start()
+        elif self.claimers and not self.stream_thread:
+            self.start_stream()
+        return False
+
+    def start_stream(self):
+        if not self.suid or self.stream_thread:
+            return
+        self.stream_stop = threading.Event()
+        self.stream_thread = threading.Thread(
+            target=self.stream_loop, args=(self.stream_stop,), daemon=True)
+        self.stream_thread.start()
+
+    def stop_stream(self):
+        if self.controller:      # controller consumes the stream permanently
+            return
+        if self.stream_stop:
+            self.stream_stop.set()
+        self.stream_thread = None
+        self.stream_stop = None
+
+    def stream_loop(self, stop):
+        # All mutable state — filter state AND the QMI address/SUID — is
+        # local to this thread: a stopped thread can linger in recvfrom for
+        # up to 3 s while a new one starts, and they must not share it.
+        addr, suid, rate = self.addr, self.suid, self.rate_hz
+        ema = None
+        fast_since = None
+        sock = None
+        while not stop.is_set():
+            try:
+                sock = socket.socket(AF_QIPCRTR, socket.SOCK_DGRAM, 0)
+                sock.settimeout(3.0)
+                cfg = tag(1, 5) + struct.pack("<f", rate)
+                sock.sendto(qmi_encode(SNS_CLIENT_REQ, 2,
+                                       client_request(suid,
+                                                      MSGID_STREAM_CONFIG,
+                                                      cfg)),
+                            addr)
+                idle = 0
+                got_data = False
+                while not stop.is_set():
+                    try:
+                        data, _ = sock.recvfrom(65536)
+                    except socket.timeout:
+                        idle += 1
+                        if idle >= 5:       # 15 s silence: resubscribe
+                            # QRTR drops sends to vanished ports silently, so
+                            # a dead subscription raises nothing — re-discover
+                            # rather than resubscribing to a stale address.
+                            if not got_data:
+                                found = self.discover_sensor()
+                                if found:
+                                    _, addr, suid, rate = found
+                            break
+                        continue
+                    got_data = True
+                    idle = 0
+                    _, _, mid, tlvs = qmi_decode(data)
+                    if mid not in (SNS_CLIENT_REPORT_IND,
+                                   SNS_CLIENT_JUMBO_IND) or 2 not in tlvs:
+                        continue
+                    for eid, pay in qmi_events(tlvs):
+                        if eid != MSGID_SENSOR_EVENT:
+                            continue
+                        body = pb_parse(pay)
+                        for v in body.get(1, []):
+                            if isinstance(v, bytes) and len(v) >= 4:
+                                # clamp: a garbage negative would make
+                                # ema**0.5 complex and crash the filter
+                                lux = max(
+                                    struct.unpack_from("<f", v, 0)[0], 0.0)
+                                ema, fast_since = self.filter_sample(
+                                    lux, ema, fast_since, rate)
+                                break
+                # Closing the socket ends the SSC client session.
+                sock.close()
+            except Exception as e:
+                # ADSP restart / QRTR hiccup / malformed datagram: stale
+                # address, dead socket, or a parse error. Re-discover the
+                # service (and the sensor, in case its SUID changed) and
+                # resubscribe rather than dying silently.
+                print(f"sensor stream error ({e!r}); re-discovering",
+                      file=sys.stderr)
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                stop.wait(5)
+                try:
+                    found = self.discover_sensor()
+                    if found:
+                        _, addr, suid, rate = found
+                except Exception:
+                    pass
+
+    def filter_sample(self, lux, ema, fast_since, rate_hz):
+        """Runs on the stream thread; returns updated (ema, fast_since)."""
+        now = GLib.get_monotonic_time() / 1e6
+        if ema is None:
+            ema = lux
+        else:
+            deviation = abs(lux - ema) / max(ema, 1.0)
+            if deviation > FAST_TRIGGER:
+                if fast_since is None:
+                    fast_since = now
+            else:
+                fast_since = None
+            fast = fast_since is not None and now - fast_since >= FAST_HOLD_S
+            tau = TAU_FAST if fast else TAU_SLOW
+            dt = 1.0 / rate_hz
+            ema += (dt / (tau + dt)) * (lux - ema)
+
+        # D-Bus carries TRUE lux (the SensorProxy contract; KDE and scripts
+        # read it as absolute). The gamma-compressed value is only for our
+        # own controller's response curve.
+        GLib.idle_add(self.update_light, round(ema, 1))
+        if self.controller and self.controller.enabled:
+            GLib.idle_add(self.controller.on_light,
+                          round(ema ** LUX_GAMMA, EMIT_ROUND))
+        return ema, fast_since
+
+    def update_light(self, value):
+        if value != self.light_level:
+            self.light_level = value
+            self.emit_changed({"LightLevel": GLib.Variant("d", value)})
+        return False
+
+
+DEFAULT_FILE = "/etc/default/sl7-sensor-proxy"
+
+
+def set_mode(mode):
+    """set-mode controller|desktop: edit /etc/default and restart the unit.
+
+    Replaces the error-prone 'sed the conffile' dance. gsettings is per-user
+    so the matching command is printed rather than run (we are root here).
+    """
+    import re
+    import subprocess
+    if mode not in ("controller", "desktop"):
+        sys.exit("usage: sl7-sensors mode controller|desktop")
+    if os.geteuid() != 0:
+        sys.exit("mode switching must run as root (edits /etc, restarts the unit)")
+    args = "--controller" if mode == "controller" else ""
+    try:
+        with open(DEFAULT_FILE) as f:
+            content = f.read()
+    except OSError as e:
+        sys.exit(f"cannot read {DEFAULT_FILE}: {e}")
+    content, nsubs = re.subn(r"^ARGS=.*$", f"ARGS={args}", content, flags=re.M)
+    if nsubs == 0:
+        # ARGS line removed by hand — append rather than silently no-op
+        content = content.rstrip("\n") + f"\nARGS={args}\n"
+    try:
+        with open(DEFAULT_FILE, "w") as f:
+            f.write(content)
+    except OSError as e:
+        sys.exit(f"cannot write {DEFAULT_FILE}: {e}")
+    subprocess.run(["systemctl", "restart", "sl7-sensor-proxy.service"],
+                   check=True)
+    print(f"mode: {mode} — service restarted.")
+    if mode == "controller":
+        print("Now disable GNOME's own auto-brightness (as your user):\n"
+              "  gsettings set org.gnome.settings-daemon.plugins.power "
+              "ambient-enabled false")
+    else:
+        print("Re-enable GNOME's auto-brightness (as your user):\n"
+              "  gsettings set org.gnome.settings-daemon.plugins.power "
+              "ambient-enabled true\n"
+              "If brightness doesn't react, lock/unlock the screen "
+              "(known gsd-power claim bug, see README).")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "set-mode":
+        set_mode(sys.argv[2] if len(sys.argv) > 2 else "")
+        sys.exit(0)
+    # --session: own the name on the session bus instead — lets the full
+    # claim/stream path be tested unprivileged (the system-bus policy only
+    # allows root to own the name).
+    # --controller: additionally drive the backlight directly (see above).
+    bus = Gio.BusType.SESSION if "--session" in sys.argv else Gio.BusType.SYSTEM
+    proxy = SensorProxy()
+    if "--controller" in sys.argv:
+        proxy.controller = BacklightController(proxy)
+    proxy.start(bus)
+    loop = GLib.MainLoop()
+    loop.run()

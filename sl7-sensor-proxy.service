@@ -1,0 +1,38 @@
+[Unit]
+Description=SensorProxy D-Bus service backed by the Qualcomm Sensor Core
+Documentation=https://github.com/valeronm/sl7-sensors
+After=sl7-sensors.service dbus.socket
+ConditionPathExists=/var/lib/sl7-sensors/sns-config/vendor/etc/sensors/sns_reg_config
+
+[Service]
+Type=dbus
+BusName=net.hadess.SensorProxy
+EnvironmentFile=-/etc/default/sl7-sensor-proxy
+ExecStart=/usr/lib/sl7-sensors/sensor-proxy $ARGS
+Restart=on-failure
+RestartSec=5
+# Exit 5 = bus name already owned (another sensor proxy): don't loop.
+RestartPreventExitStatus=5
+StateDirectory=sl7-sensor-proxy
+
+# Hardening: the daemon only needs the D-Bus system socket, AF_QIPCRTR to
+# the DSP, its state dir, and (in controller mode) writes to
+# /sys/class/backlight — ProtectSystem=strict leaves /sys writable, so no
+# ProtectKernelTunables here. No MemoryDenyWriteExecute: python3-gi needs
+# libffi trampolines.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictAddressFamilies=AF_UNIX AF_QIPCRTR
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

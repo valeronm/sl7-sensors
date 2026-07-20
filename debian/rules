@@ -1,0 +1,39 @@
+#!/usr/bin/make -f
+
+PRIVLIB = /usr/lib/sl7-sensors
+
+%:
+	dh $@
+
+# fastrpc is a vendored submodule (github.com/quic/fastrpc); build only the
+# pieces the sensors attach needs and install them into a private libdir so
+# a future distro fastrpc package cannot collide.
+override_dh_auto_configure:
+	cd fastrpc && autoreconf -fi && \
+	    CFLAGS="$$(dpkg-buildflags --get CFLAGS) $$(dpkg-buildflags --get CPPFLAGS)" \
+	    LDFLAGS="$$(dpkg-buildflags --get LDFLAGS)" \
+	    ./configure --disable-dependency-tracking
+
+override_dh_auto_build:
+	$(MAKE) -C fastrpc
+
+override_dh_auto_install:
+	install -D -m755 fastrpc/src/adsprpcd \
+	    debian/sl7-sensors$(PRIVLIB)/adsprpcd
+	install -m644 fastrpc/src/.libs/libadsprpc.so.1.0.0 \
+	    debian/sl7-sensors$(PRIVLIB)/libadsprpc.so.1
+	install -m644 fastrpc/src/.libs/libadsp_default_listener.so.1.0.0 \
+	    debian/sl7-sensors$(PRIVLIB)/libadsp_default_listener.so.1
+
+override_dh_auto_clean:
+	-$(MAKE) -C fastrpc distclean
+	dh_auto_clean
+
+# The private libs have no shlibs metadata of their own; system-library
+# dependencies are still computed from their NEEDED entries.
+override_dh_shlibdeps:
+	dh_shlibdeps -l$(CURDIR)/debian/sl7-sensors$(PRIVLIB) -- --ignore-missing-info
+
+# adsprpcd dlopens the listener library; LD_LIBRARY_PATH in the unit points
+# at the private dir, no ldconfig entry wanted.
+override_dh_makeshlibs:

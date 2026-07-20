@@ -1,0 +1,157 @@
+#!/bin/bash
+# sl7-sensors setup — one-time extraction of the Qualcomm Sensor Core (SSC)
+# configuration from this machine's Windows partition.
+#
+# The DSP-side sensor registry reads its configuration (sensor wiring,
+# factory calibration) from the host at runtime. Those files ship with
+# Windows and are not redistributable, so each machine extracts its own.
+#
+# Usage: sl7-sensors setup [path-to-windows-root]
+#   With no argument, internal NTFS partitions are scanned for a Windows
+#   installation.
+set -euo pipefail
+
+STATE=/var/lib/sl7-sensors
+SERVE=$STATE/sns-config
+MOUNTED=""
+NEW=""
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# Single EXIT trap driven by state vars: NEW is the staging dir (a failed
+# extraction must never leave a half-built tree behind), MOUNTED is a Windows
+# volume we mounted ourselves. Both are cleared once no longer ours.
+cleanup() {
+    if [ -n "$NEW" ]; then
+        rm -rf "$NEW"
+    fi
+    if [ -n "$MOUNTED" ]; then
+        umount "$MOUNTED" 2>/dev/null || true
+        rmdir "$MOUNTED" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
+[ "$(id -u)" = 0 ] || die "must run as root (writes $STATE, may mount NTFS)"
+
+# --- locate a Windows installation ------------------------------------------
+winroot=""
+if [ $# -ge 1 ]; then
+    winroot=$1
+    [ -d "$winroot/Windows/System32/DriverStore" ] \
+        || die "$winroot does not look like a Windows root"
+else
+    # already-mounted Windows?
+    for m in /media/*/* /run/media/*/* /mnt /mnt/*; do
+        [ -d "$m/Windows/System32/DriverStore" ] && { winroot=$m; break; }
+    done
+    # otherwise scan INTERNAL (non-removable) NTFS partitions
+    if [ -z "$winroot" ]; then
+        while read -r dev fstype rm; do
+            [ "$fstype" = ntfs ] || continue
+            [ "$rm" = 0 ] || continue    # skip USB sticks etc.
+            tmp=$(mktemp -d /run/sl7-sensors-win.XXXXXX)
+            MOUNTED=$tmp
+            if mount -o ro,nosuid,nodev,noexec "/dev/$dev" "$tmp" 2>/dev/null
+            then
+                if [ -d "$tmp/Windows/System32/DriverStore" ]; then
+                    winroot=$tmp
+                    break
+                fi
+                umount "$tmp" 2>/dev/null || true
+            fi
+            rmdir "$tmp" 2>/dev/null || true
+            MOUNTED=""
+        done < <(lsblk -rno NAME,FSTYPE,RM)
+    fi
+fi
+[ -n "$winroot" ] || die "no Windows installation found; pass its mount point.
+(If Windows uses Fast Startup or is hibernated, its NTFS volume cannot be
+mounted read-only — boot Windows once and shut it down fully, or run
+'powercfg /h off' there.)"
+echo "Windows root: $winroot"
+
+# --- locate the sensor configuration driver package -------------------------
+repo=$winroot/Windows/System32/DriverStore/FileRepository
+# trailing slash: match only DIRECTORIES — the DriverStore keeps same-named
+# .ini sibling FILES next to each package dir, which would otherwise win the
+# newest-by-mtime pick.
+shopt -s nullglob nocaseglob
+pkgs=("$repo"/*snscfg*.inf_arm64_*/)
+shopt -u nullglob nocaseglob
+[ ${#pkgs[@]} -gt 0 ] || die "no *snscfg* driver package in $repo —
+this Windows install may predate sensor support, or the device has no SSC
+sensor configuration. Nothing to extract."
+# newest package wins if several versions accumulated in the DriverStore
+pkg=$(ls -1dt "${pkgs[@]}" | head -1)
+pkg=${pkg%/}
+[ ${#pkgs[@]} -gt 1 ] && echo "note: multiple snscfg packages, using newest"
+echo "sensor config package: $(basename "$pkg")"
+
+# --- build the serving tree the DSP expects ---------------------------------
+# apps_std fopen resolves absolute request paths under each ADSP_LIBRARY_PATH
+# entry, so canonical Android paths live inside the serving root. opendir is
+# literal-only, hence the /persist symlink (installed via tmpfiles.d).
+# Build into a staging dir and swap at the end: a failed extraction must
+# never destroy an existing working config.
+install -d "$STATE"
+NEW=$(mktemp -d "$STATE/sns-config.new.XXXXXX")
+install -d "$NEW/vendor/etc/sensors/config" \
+           "$NEW/sys/devices/soc0" \
+           "$NEW/persist/sensors/registry/registry"
+
+# regular files only, never dereferencing symlinks: the source filesystem is
+# untrusted and ntfs3 supports symlinks/reparse points.
+find "$pkg" -maxdepth 1 -type f \
+     ! -name '*.inf' ! -name '*.cat' \
+     -exec cp -t "$NEW/vendor/etc/sensors/config/" -- {} +
+mv "$NEW/vendor/etc/sensors/config/sns_reg_config" \
+   "$NEW/vendor/etc/sensors/" 2>/dev/null \
+    || die "package has no sns_reg_config"
+
+for f in hw_platform soc_id platform_subtype platform_subtype_id \
+         platform_version revision; do
+    src=$NEW/vendor/etc/sensors/config/$f
+    [ -f "$src" ] && cp "$src" "$NEW/sys/devices/soc0/"
+done
+
+# CRLF is fatal: the DSP-side parsers keep the \r and build corrupt paths.
+sed -i 's/\r$//' "$NEW/vendor/etc/sensors/sns_reg_config" \
+                 "$NEW"/vendor/etc/sensors/config/json.lst \
+                 "$NEW"/vendor/etc/sensors/config/*.json \
+                 "$NEW"/sys/devices/soc0/* 2>/dev/null || true
+
+# world-readable; writes happen only from the root-owned file service
+chmod -R a+rX "$NEW"
+
+# --- sanity: does the config's gating match this SoC? -----------------------
+if [ -r /sys/devices/soc0/soc_id ] \
+        && [ -r "$NEW/sys/devices/soc0/soc_id" ]; then
+    live=$(cat /sys/devices/soc0/soc_id)
+    cfg=$(cat "$NEW/sys/devices/soc0/soc_id")
+    [ "$live" = "$cfg" ] || echo \
+        "warning: live soc_id=$live but config was tuned for soc_id=$cfg —
+sensor configs may not activate. Continuing anyway."
+fi
+
+# atomic-ish swap: only replace the live tree after a complete extraction
+rm -rf "$SERVE"
+mv "$NEW" "$SERVE"
+NEW=""    # consumed by the swap — nothing staged left to clean up
+
+n=$(find "$SERVE/vendor/etc/sensors/config" -type f | wc -l)
+echo "extracted $n config files to $SERVE"
+
+# --- activate ---------------------------------------------------------------
+if [ -d /run/systemd/system ]; then
+    systemd-tmpfiles --create sl7-sensors.conf
+    systemctl restart sl7-sensors.service
+    systemctl restart sl7-sensor-proxy.service
+    echo "services restarted — the DSP registry re-reads its config on every"
+    echo "attach. Verify with: sl7-sensors lux"
+else
+    echo "no systemd detected — start sl7-sensors and sl7-sensor-proxy"
+    echo "manually, and create /persist per tmpfiles.d/sl7-sensors.conf"
+fi
+echo
+echo "Optional direct auto-brightness: sl7-sensors mode controller"

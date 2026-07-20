@@ -1,0 +1,23 @@
+[Unit]
+Description=Qualcomm Sensor Core file service (sensors-PD FastRPC attach)
+Documentation=https://github.com/valeronm/sl7-sensors
+# Activated ONLY by udev when /dev/fastrpc-adsp appears (no [Install]:
+# starting before the device exists would just fail-loop).
+# The attach makes the DSP-side sensor registry (re)read its configuration
+# from the served tree; sensors keep streaming over QMI even if this daemon
+# later stops. No-op until sl7-sensors-setup has extracted the config.
+ConditionPathExists=/var/lib/sl7-sensors/sns-config/vendor/etc/sensors/sns_reg_config
+# Bound the retry loop on machines without a fastrpc device.
+StartLimitIntervalSec=10min
+StartLimitBurst=10
+
+[Service]
+Type=simple
+Environment=ADSP_LIBRARY_PATH=/var/lib/sl7-sensors/sns-config
+Environment=LD_LIBRARY_PATH=/usr/lib/sl7-sensors
+ExecStart=/usr/lib/sl7-sensors/adsprpcd sensorspd adsp
+Restart=on-failure
+RestartSec=10
+# A stuck fastrpc invoke sits in uninterruptible sleep for up to ~80 s;
+# give SIGTERM time, then systemd's SIGKILL lands when the ioctl times out.
+TimeoutStopSec=100

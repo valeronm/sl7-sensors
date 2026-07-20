@@ -1,0 +1,4 @@
+# The DSP-side registry lists its database directory via a LITERAL opendir
+# on the canonical Android path — unlike file opens, no search-path prefixing
+# applies, so /persist must really exist. Keep it inside our state dir.
+L /persist - - - - /var/lib/sl7-sensors/sns-config/persist

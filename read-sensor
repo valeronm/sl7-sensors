@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Stream the SL7 ambient light sensor (TCS3430 behind the SSC) to the terminal.
+
+Subscribes to the 'ambient_light' sensor over QMI/QRTR at 1 Hz and prints
+one line per sample until Ctrl-C. Requires the SSC registry to be populated
+(the sl7-sensors service; run 'sl7-sensors setup' once first).
+
+Usage: sl7-sensors lux            (ambient light: lux + raw channel)
+       sl7-sensors color          (labeled color/CCT output)
+       read-sensor [data_type]    (any SSC data type, raw floats)
+"""
+import socket
+import struct
+import sys
+import time
+
+AF_QIPCRTR = 42
+SNS_SERVICE = 400
+SNS_CLIENT_REQ = 0x20
+SNS_CLIENT_REPORT_IND = 0x21
+SNS_CLIENT_JUMBO_IND = 0x22
+SUID_LOOKUP = (0xABABABABABABABAB, 0xABABABABABABABAB)
+SNS_SUID_MSGID_REQ = 512
+SNS_SUID_MSGID_EVENT = 768
+MSGID_STREAM_CONFIG = 513       # sns_std_sensor_config (rate in Hz)
+MSGID_SENSOR_EVENT = 1025       # sns_std_sensor_event (float data[])
+MSGID_ERROR_EVENT = 130
+
+if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+    print(__doc__.strip())
+    sys.exit(0)
+
+DATA_TYPE = sys.argv[1] if len(sys.argv) > 1 else "ambient_light"
+SAMPLE_RATE_HZ = 1.0
+
+
+def varint(n):
+    out = b""
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out += bytes([b | (0x80 if n else 0)])
+        if not n:
+            return out
+
+
+def tag(field, wire):
+    return varint(field << 3 | wire)
+
+
+def pb_bytes(field, data):
+    return tag(field, 2) + varint(len(data)) + data
+
+
+def pb_varint(field, val):
+    return tag(field, 0) + varint(val)
+
+
+def pb_fixed32(field, val):
+    return tag(field, 5) + struct.pack("<I", val)
+
+
+def pb_fixed64(field, val):
+    return tag(field, 1) + struct.pack("<Q", val)
+
+
+def read_varint(buf, i):
+    val = shift = 0
+    while i < len(buf):
+        b = buf[i]
+        i += 1
+        val |= (b & 0x7F) << shift
+        if not b & 0x80:
+            return val, i
+        shift += 7
+    return val, i
+
+
+def pb_parse(buf):
+    out, i = {}, 0
+    while i < len(buf):
+        t, i = read_varint(buf, i)
+        f, w = t >> 3, t & 7
+        if w == 0:
+            v, i = read_varint(buf, i)
+        elif w == 1:
+            v, i = buf[i:i + 8], i + 8
+        elif w == 2:
+            ln, i = read_varint(buf, i)
+            v, i = buf[i:i + ln], i + ln
+        elif w == 5:
+            v, i = buf[i:i + 4], i + 4
+        else:
+            break
+        out.setdefault(f, []).append(v)
+    return out
+
+
+def qmi_encode(msg_id, txn, payload):
+    val = struct.pack("<H", len(payload)) + payload
+    body = b"\x01" + struct.pack("<H", len(val)) + val
+    return struct.pack("<BHHH", 0, txn, msg_id, len(body)) + body
+
+
+def qmi_decode(buf):
+    if len(buf) < 7:
+        return None, None, None, {}
+    mtype, txn, msg_id, _ = struct.unpack_from("<BHHH", buf, 0)
+    tlvs, i = {}, 7
+    while i + 3 <= len(buf):
+        t, ln = buf[i], struct.unpack_from("<H", buf, i + 1)[0]
+        tlvs[t] = buf[i + 3:i + 3 + ln]
+        i += 3 + ln
+    return mtype, txn, msg_id, tlvs
+
+
+def client_request(suid, msg_id, payload=b""):
+    suid_msg = pb_fixed64(1, suid[0]) + pb_fixed64(2, suid[1])
+    susp = pb_varint(1, 1) + pb_varint(2, 0)   # APSS processor, wakeup delivery
+    req = pb_bytes(2, payload) if payload else b""
+    return (pb_bytes(1, suid_msg) + pb_fixed32(2, msg_id) +
+            pb_bytes(3, susp) + pb_bytes(4, req))
+
+
+def events(tlvs):
+    """Yield (msg_id, payload) from an indication's TLV 2."""
+    for e in pb_parse(tlvs[2][2:]).get(2, []):
+        inner = pb_parse(e)
+        if 1 not in inner:
+            continue
+        eid = struct.unpack("<I", inner[1][0])[0]
+        yield eid, inner[3][0] if 3 in inner else b""
+
+
+def find_service():
+    s = socket.socket(AF_QIPCRTR, socket.SOCK_DGRAM, 0)
+    s.settimeout(2.0)
+    s.sendto(struct.pack("<5I", 10, 0, 0, 0, 0), (1, 0xFFFFFFFE))  # NEW_LOOKUP
+    found = None
+    while True:
+        try:
+            data, _ = s.recvfrom(4096)
+        except socket.timeout:
+            break
+        if len(data) >= 20:
+            cmd, svc, _, node, port = struct.unpack_from("<5I", data, 0)
+            if cmd == 4 and svc == SNS_SERVICE:
+                found = (node, port)
+    s.close()
+    return found
+
+
+def main():
+    addr = find_service()
+    if not addr:
+        sys.exit("sensors QMI service (400) not found on QRTR")
+
+    sock = socket.socket(AF_QIPCRTR, socket.SOCK_DGRAM, 0)
+    sock.settimeout(3.0)
+
+    req = client_request(SUID_LOOKUP, SNS_SUID_MSGID_REQ,
+                         pb_bytes(1, DATA_TYPE.encode()) + pb_varint(2, 0))
+    sock.sendto(qmi_encode(SNS_CLIENT_REQ, 1, req), addr)
+
+    target = None
+    deadline = time.time() + 6
+    while time.time() < deadline and not target:
+        try:
+            data, _ = sock.recvfrom(65536)
+        except socket.timeout:
+            break
+        _, _, mid, tlvs = qmi_decode(data)
+        if mid not in (SNS_CLIENT_REPORT_IND, SNS_CLIENT_JUMBO_IND) or 2 not in tlvs:
+            continue
+        for eid, pay in events(tlvs):
+            if eid != SNS_SUID_MSGID_EVENT:
+                continue
+            se = pb_parse(pay)
+            for sb in se.get(2, []):
+                su = pb_parse(sb)
+                target = (struct.unpack("<Q", su[1][0])[0],
+                          struct.unpack("<Q", su[2][0])[0])
+    if not target:
+        sys.exit(f"no '{DATA_TYPE}' sensor found — is adsprpcd sensorspd running "
+                 "and the registry populated?")
+
+    cfg = tag(1, 5) + struct.pack("<f", SAMPLE_RATE_HZ)
+    sock.sendto(qmi_encode(SNS_CLIENT_REQ, 2,
+                           client_request(target, MSGID_STREAM_CONFIG, cfg)), addr)
+
+    print(f"{DATA_TYPE} @ {SAMPLE_RATE_HZ:g} Hz — Ctrl-C to stop", flush=True)
+    idle = 0
+    try:
+        while True:
+            try:
+                data, _ = sock.recvfrom(65536)
+            except socket.timeout:
+                # QRTR drops sends to vanished ports silently (ADSP restart,
+                # service stopped), so a dead subscription raises nothing —
+                # say so instead of sitting here looking healthy.
+                idle += 1
+                if idle == 5:
+                    print("no data for 15 s — ADSP restarted or "
+                          "sl7-sensors.service stopped? Re-run to resubscribe.",
+                          file=sys.stderr)
+                continue
+            idle = 0
+            _, _, mid, tlvs = qmi_decode(data)
+            if mid not in (SNS_CLIENT_REPORT_IND, SNS_CLIENT_JUMBO_IND) or 2 not in tlvs:
+                continue
+            for eid, pay in events(tlvs):
+                if eid == MSGID_SENSOR_EVENT:
+                    body = pb_parse(pay)
+                    floats = []
+                    for v in body.get(1, []):
+                        if isinstance(v, bytes):
+                            floats += [struct.unpack_from("<f", v, o)[0]
+                                       for o in range(0, len(v) - 3, 4)]
+                    now = time.strftime("%H:%M:%S")
+                    if DATA_TYPE == "color" and len(floats) >= 14:
+                        # Layout (recovered empirically from sns_surface_color):
+                        # lux, CCT K, CIE x, CIE y, R, G, B,
+                        # raw X, Y, Z, IR, flags, atime, again
+                        f = floats
+                        vals = (f"lux={f[0]:7.1f}  cct={f[1]:5.0f}K  "
+                                f"xy=({f[2]:.3f},{f[3]:.3f})  "
+                                f"rgb=({f[4]:.0f},{f[5]:.0f},{f[6]:.0f})  "
+                                f"rawXYZI=({f[7]:.0f},{f[8]:.0f},"
+                                f"{f[9]:.0f},{f[10]:.0f})")
+                    elif DATA_TYPE == "ambient_light" and len(floats) == 2:
+                        vals = f"lux={floats[0]:7.1f}  raw={floats[1]:8.1f}"
+                    else:
+                        vals = "  ".join(f"{v:10.1f}" for v in floats)
+                    print(f"{now}  {vals}", flush=True)
+                elif eid == MSGID_ERROR_EVENT:
+                    print(f"error event: {pay.hex()}", file=sys.stderr)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

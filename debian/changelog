@@ -1,0 +1,10 @@
+sl7-sensors (1.0) unstable; urgency=medium
+
+  * Initial release: SSC sensor bring-up for the Surface Laptop 7 —
+    sensors-PD FastRPC file service feeding the DSP registry the sensor
+    configuration extracted from the machine's Windows partition,
+    net.hadess.SensorProxy daemon with optional direct backlight
+    controller, and the unified sl7-sensors CLI (setup, lux, color, mode,
+    status).
+
+ -- valeronm <valeriy@hey.com>  Mon, 20 Jul 2026 19:30:00 +0100

@@ -1,0 +1,11 @@
+# Arguments for sl7-sensor-proxy.service.
+#
+# Default (empty): serve net.hadess.SensorProxy only — GNOME's built-in
+# auto-brightness (Settings > Power > Automatic Screen Brightness) consumes
+# it, exactly as it would an iio-sensor-proxy sensor.
+#
+# ARGS=--controller  bypasses GNOME's controller and drives the backlight
+# directly with smooth ramping; the brightness slider keeps working and
+# doubles as the calibration anchor. Disable GNOME's version first:
+#   gsettings set org.gnome.settings-daemon.plugins.power ambient-enabled false
+ARGS=

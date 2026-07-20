@@ -1,0 +1,32 @@
+#!/bin/sh
+set -e
+
+# One-time migration from the pre-release command naming (ssc-sensor-proxy):
+# carry the mode choice and calibration anchor across the rename, and drop
+# the obsolete unit's leftovers. Harmless no-ops on fresh installs.
+if [ "$1" = "configure" ]; then
+    if [ -f /etc/default/ssc-sensor-proxy ]; then
+        old_args=$(sed -n 's/^ARGS=//p' /etc/default/ssc-sensor-proxy | head -n1)
+        if [ -n "$old_args" ]; then
+            sed -i "s|^ARGS=.*|ARGS=$old_args|" /etc/default/sl7-sensor-proxy
+        fi
+        rm -f /etc/default/ssc-sensor-proxy
+    fi
+    if [ -d /var/lib/ssc-sensor-proxy ] \
+            && [ ! -e /var/lib/sl7-sensor-proxy/anchor.json ]; then
+        mkdir -p /var/lib/sl7-sensor-proxy
+        if [ -f /var/lib/ssc-sensor-proxy/ssc-sensor-proxy.json ]; then
+            cp /var/lib/ssc-sensor-proxy/ssc-sensor-proxy.json \
+               /var/lib/sl7-sensor-proxy/anchor.json
+        fi
+        rm -rf /var/lib/ssc-sensor-proxy
+    fi
+    rm -f /etc/systemd/system/multi-user.target.wants/ssc-sensor-proxy.service
+    # the old unit's process would otherwise keep running and hold the bus name
+    if [ -d /run/systemd/system ]; then
+        systemctl stop ssc-sensor-proxy.service 2>/dev/null || true
+        systemctl daemon-reload || true
+    fi
+fi
+
+#DEBHELPER#

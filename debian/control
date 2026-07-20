@@ -1,0 +1,32 @@
+Source: sl7-sensors
+Section: admin
+Priority: optional
+Maintainer: valeronm <valeriy@hey.com>
+Build-Depends: debhelper-compat (= 13), autoconf, automake, libtool,
+ pkgconf, libbsd-dev, libyaml-dev
+Homepage: https://github.com/valeronm/sl7-sensors
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: sl7-sensors
+Architecture: arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}, python3, python3-gi
+Description: Ambient light / color sensor support for Surface Laptop 7 (X Elite)
+ On Snapdragon X Elite laptops the ambient light sensor is not on any
+ host-visible bus: it hangs off the Qualcomm Sensor Core (SSC) running on
+ the ADSP, and the DSP firmware reads its sensor configuration (wiring,
+ factory calibration) from the host filesystem at runtime over FastRPC.
+ Windows provides that file service; Linux does not — so the SSC boots
+ empty and no sensors exist.
+ .
+ This package provides the missing pieces: a FastRPC file service attached
+ to the sensors protection domain (adsprpcd, built from Qualcomm's open
+ source userspace) serving the sensor configuration extracted from the
+ machine's own Windows partition via 'sl7-sensors setup' (the files are
+ not redistributable), a net.hadess.SensorProxy D-Bus daemon so desktop
+ auto-brightness works without IIO hardware (with an optional built-in
+ backlight controller), and command-line sensor readers
+ ('sl7-sensors lux' / 'sl7-sensors color').
+ .
+ Developed on the Surface Laptop 7; the mechanism should apply to other
+ X Elite machines whose Windows install carries an snscfg driver package.

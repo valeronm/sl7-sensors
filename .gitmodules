@@ -1,0 +1,3 @@
+[submodule "fastrpc"]
+	path = fastrpc
+	url = https://github.com/quic/fastrpc.git

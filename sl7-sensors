@@ -1,0 +1,64 @@
+#!/bin/bash
+# sl7-sensors — user-facing entry point for the SL7 sensor stack.
+set -euo pipefail
+
+LIB=/usr/lib/sl7-sensors
+DEFAULT=/etc/default/sl7-sensor-proxy
+
+usage() {
+    cat <<'EOF'
+usage: sl7-sensors <command>
+
+  setup                     extract the sensor configuration from this
+                            machine's Windows partition (one-time, root)
+  lux                       stream the ambient light sensor to the terminal
+  color                     stream the color sensor (lux, CCT, chromaticity)
+  mode controller|desktop   choose who drives auto-brightness: this
+                            package's backlight controller, or the
+                            desktop's own (GNOME/KDE) — root
+  status                    show services, mode and a current reading
+EOF
+    exit "${1:-0}"
+}
+
+[ $# -ge 1 ] || usage 1
+cmd=$1; shift
+case "$cmd" in
+    setup)
+        exec "$LIB/setup" "$@" ;;
+    lux)
+        # no "$@": a stray argument would silently switch the data type
+        # (read-sensor's positional arg — use it directly for other types)
+        exec "$LIB/read-sensor" ;;
+    color)
+        exec "$LIB/read-sensor" color ;;
+    mode)
+        exec "$LIB/sensor-proxy" set-mode "$@" ;;
+    status)
+        for unit in sl7-sensors sl7-sensor-proxy; do
+            printf '%-18s %s\n' "$unit:" \
+                "$(systemctl is-active "$unit.service" 2>/dev/null || true)"
+        done
+        args=$(grep '^ARGS=' "$DEFAULT" 2>/dev/null | cut -d= -f2- || true)
+        if [ "$args" = "--controller" ]; then
+            printf '%-18s controller (this package drives the backlight)\n' \
+                "mode:"
+        else
+            printf '%-18s desktop (GNOME/KDE consumes the sensor proxy)\n' \
+                "mode:"
+        fi
+        prop() {
+            busctl get-property net.hadess.SensorProxy \
+                /net/hadess/SensorProxy net.hadess.SensorProxy "$1" \
+                2>/dev/null | awk '{print $2}'
+        }
+        has=$(prop HasAmbientLight) || true
+        lux=$(prop LightLevel) || true
+        printf '%-18s %s\n' "sensor present:" "${has:-unknown}"
+        printf '%-18s %s\n' "last lux:" "${lux:-n/a}"
+        ;;
+    -h|--help|help)
+        usage ;;
+    *)
+        echo "unknown command: $cmd" >&2; usage 1 ;;
+esac

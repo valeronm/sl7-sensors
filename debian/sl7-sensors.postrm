@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+# The /persist symlink is created by tmpfiles.d; the conf file is gone after
+# removal, so clean it up ourselves — but only if it is OUR symlink.
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+    if [ -L /persist ] \
+            && [ "$(readlink /persist)" = "/var/lib/sl7-sensors/sns-config/persist" ]; then
+        rm -f /persist
+    fi
+fi
+
+# On purge, drop the extracted (proprietary, per-machine) Windows sensor
+# config and the controller's calibration state.
+if [ "$1" = "purge" ]; then
+    rm -rf /var/lib/sl7-sensors /var/lib/sl7-sensor-proxy
+fi
+
+#DEBHELPER#

@@ -1,0 +1,2 @@
+# Start the SSC file service as soon as the ADSP fastrpc device exists.
+ACTION=="add", KERNEL=="fastrpc-adsp", TAG+="systemd", ENV{SYSTEMD_WANTS}+="sl7-sensors.service"
