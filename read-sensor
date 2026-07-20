@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Stream the SL7 ambient light sensor (TCS3430 behind the SSC) to the terminal.
 
 Subscribes to the 'ambient_light' sensor over QMI/QRTR at 1 Hz and prints

@@ -11,12 +11,14 @@
 #   installation.
 set -euo pipefail
 
-STATE=/var/lib/sl7-sensors
+# SL7_SENSORS_STATE: test-suite override (tests/test_setup.py) — extraction
+# runs against a scratch state dir, unprivileged, without touching services.
+STATE=${SL7_SENSORS_STATE:-/var/lib/sl7-sensors}
 SERVE=$STATE/sns-config
 MOUNTED=""
 NEW=""
 
-die() { echo "error: $*" >&2; exit 1; }
+die() { echo "sl7-sensors setup: error: $*" >&2; exit 1; }
 
 # Single EXIT trap driven by state vars: NEW is the staging dir (a failed
 # extraction must never leave a half-built tree behind), MOUNTED is a Windows
@@ -32,7 +34,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-[ "$(id -u)" = 0 ] || die "must run as root (writes $STATE, may mount NTFS)"
+[ "$(id -u)" = 0 ] || [ -n "${SL7_SENSORS_STATE:-}" ] \
+    || die "must run as root (writes $STATE, may mount NTFS)"
 
 # --- locate a Windows installation ------------------------------------------
 winroot=""
@@ -83,6 +86,7 @@ shopt -u nullglob nocaseglob
 this Windows install may predate sensor support, or the device has no SSC
 sensor configuration. Nothing to extract."
 # newest package wins if several versions accumulated in the DriverStore
+# shellcheck disable=SC2012  # DriverStore names are alphanumeric; ls -t is fine
 pkg=$(ls -1dt "${pkgs[@]}" | head -1)
 pkg=${pkg%/}
 [ ${#pkgs[@]} -gt 1 ] && echo "note: multiple snscfg packages, using newest"
@@ -143,7 +147,9 @@ n=$(find "$SERVE/vendor/etc/sensors/config" -type f | wc -l)
 echo "extracted $n config files to $SERVE"
 
 # --- activate ---------------------------------------------------------------
-if [ -d /run/systemd/system ]; then
+if [ -n "${SL7_SENSORS_STATE:-}" ]; then
+    echo "state override active — skipping service activation"
+elif [ -d /run/systemd/system ]; then
     systemd-tmpfiles --create sl7-sensors.conf
     systemctl restart sl7-sensors.service
     systemctl restart sl7-sensor-proxy.service

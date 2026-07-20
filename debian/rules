@@ -1,5 +1,7 @@
 #!/usr/bin/make -f
 
+export DEB_BUILD_MAINT_OPTIONS = hardening=+bindnow
+
 PRIVLIB = /usr/lib/sl7-sensors
 
 %:
@@ -24,6 +26,20 @@ override_dh_auto_install:
 	    debian/sl7-sensors$(PRIVLIB)/libadsprpc.so.1
 	install -m644 fastrpc/src/.libs/libadsp_default_listener.so.1.0.0 \
 	    debian/sl7-sensors$(PRIVLIB)/libadsp_default_listener.so.1
+	# libtool RUNPATHs point into the build tree; the unit's LD_LIBRARY_PATH
+	# is the lookup mechanism, so strip them ("|| true": chrpath fails on
+	# files with no RUNPATH — lintian gates any survivor in CI)
+	for f in debian/sl7-sensors$(PRIVLIB)/adsprpcd \
+	         debian/sl7-sensors$(PRIVLIB)/lib*.so.1; do \
+	    chrpath -d $$f || true; \
+	done
+
+# Unit tests: pure framing/filter/controller logic plus the setup
+# extraction against a fake DriverStore — no hardware, no root, no D-Bus
+# (tests/conftest.py imports the extensionless scripts by path). dh skips
+# this under DEB_BUILD_OPTIONS=nocheck.
+override_dh_auto_test:
+	python3 -m pytest tests
 
 override_dh_auto_clean:
 	-$(MAKE) -C fastrpc distclean

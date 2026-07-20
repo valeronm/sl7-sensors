@@ -6,3 +6,5 @@ debian/*.debhelper
 debian/*.debhelper.log
 debian/debhelper-build-stamp
 *.pyc
+__pycache__/
+CLAUDE.md

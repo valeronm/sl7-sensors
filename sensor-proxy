@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """net.hadess.SensorProxy drop-in backed by the Qualcomm Sensor Core (SSC).
 
 Owns the SensorProxy D-Bus name that GNOME's gsd-power consumes for

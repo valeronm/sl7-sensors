@@ -1,3 +1,23 @@
+sl7-sensors (1.0.1) unstable; urgency=medium
+
+  * Test suite: 72 pytest cases — QMI/protobuf framing (with a drift guard
+    between read-sensor and sensor-proxy), EMA filter, backlight
+    controller math and corrupt-anchor handling, set-mode rewrite, CLI,
+    and the setup extraction end-to-end against a fake DriverStore.
+    Wired into the package build via dh_auto_test.
+  * Systemd sandbox for sl7-sensors.service (ReadWritePaths for the
+    DSP-written registry; no PrivateDevices — needs /dev/fastrpc-adsp).
+  * Lintian-clean at --fail-on error,warning: sl7-sensors(1) man page,
+    libtool build-tree RUNPATH stripped (chrpath), bindnow hardening,
+    orphaned GPL-3+ stanza dropped from debian/copyright.
+  * Removed the pre-release ssc-sensor-proxy migration from postinst.
+  * CI: two-job least-privilege workflow shared with sl7-mac — static
+    checks, tag/changelog gate, lintian gate, create-or-update release.
+  * Polish: absolute python3 shebangs, prefixed error messages, idle-dim
+    caveat and Releases pointer in README.
+
+ -- valeronm <valeriy@hey.com>  Mon, 20 Jul 2026 22:55:00 +0100
+
 sl7-sensors (1.0) unstable; urgency=medium
 
   * Initial release: SSC sensor bring-up for the Surface Laptop 7 —

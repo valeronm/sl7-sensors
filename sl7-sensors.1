@@ -1,0 +1,50 @@
+.TH SL7-SENSORS 1 "July 2026" "sl7-sensors" "User Commands"
+.SH NAME
+sl7-sensors \- ambient light / color sensor support for the Surface Laptop 7
+.SH SYNOPSIS
+.B sl7-sensors
+.IR command " [" args "]"
+.SH DESCRIPTION
+On Snapdragon X Elite laptops the ambient light sensor belongs to the
+Qualcomm Sensor Core (SSC) on the ADSP, which reads its sensor
+configuration from the host filesystem at runtime over FastRPC.
+.B sl7-sensors
+supplies that file service, a net.hadess.SensorProxy D-Bus daemon for
+desktop auto-brightness, and command-line sensor readers.
+.SH COMMANDS
+.TP
+.B setup \fR[\fIwindows-root\fR]
+One-time extraction of the sensor configuration from this machine's
+Windows partition (root). With no argument, internal NTFS partitions are
+scanned for a Windows installation.
+.TP
+.B lux
+Stream the ambient light sensor to the terminal, one line per second.
+.TP
+.B color
+Stream the color sensor: lux, correlated color temperature, chromaticity,
+RGB and raw channels.
+.TP
+.B mode \fRcontroller|desktop
+Choose who drives auto-brightness (root): this package's direct backlight
+controller, or the desktop's own (GNOME/KDE) via the sensor proxy. Prints
+the matching per-user
+.BR gsettings (1)
+command to run afterwards.
+.TP
+.B status
+Show service states, the active mode and a current sensor reading.
+.SH FILES
+.TP
+.I /var/lib/sl7-sensors/sns-config
+Extracted sensor configuration served to the DSP.
+.TP
+.I /etc/default/sl7-sensor-proxy
+Sensor proxy arguments; edited by
+.BR "sl7-sensors mode" .
+.TP
+.I /var/lib/sl7-sensor-proxy/anchor.json
+The direct controller's calibration anchor.
+.SH SEE ALSO
+Full documentation and caveats:
+.I /usr/share/doc/sl7-sensors/README.md.gz

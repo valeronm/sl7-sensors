@@ -60,5 +60,5 @@ case "$cmd" in
     -h|--help|help)
         usage ;;
     *)
-        echo "unknown command: $cmd" >&2; usage 1 ;;
+        echo "sl7-sensors: unknown command: $cmd" >&2; usage 1 ;;
 esac

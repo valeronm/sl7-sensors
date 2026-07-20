@@ -5,7 +5,7 @@ Documentation=https://github.com/valeronm/sl7-sensors
 # starting before the device exists would just fail-loop).
 # The attach makes the DSP-side sensor registry (re)read its configuration
 # from the served tree; sensors keep streaming over QMI even if this daemon
-# later stops. No-op until sl7-sensors-setup has extracted the config.
+# later stops. No-op until 'sl7-sensors setup' has extracted the config.
 ConditionPathExists=/var/lib/sl7-sensors/sns-config/vendor/etc/sensors/sns_reg_config
 # Bound the retry loop on machines without a fastrpc device.
 StartLimitIntervalSec=10min
@@ -21,3 +21,21 @@ RestartSec=10
 # A stuck fastrpc invoke sits in uninterruptible sleep for up to ~80 s;
 # give SIGTERM time, then systemd's SIGKILL lands when the ioctl times out.
 TimeoutStopSec=100
+
+# Hardening: needs /dev/fastrpc-adsp (so no PrivateDevices) and write
+# access to the served tree — the DSP registry writes its database back
+# through this file service (sns-config/persist).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sl7-sensors
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native

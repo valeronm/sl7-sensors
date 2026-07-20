@@ -31,6 +31,10 @@ This package supplies the missing pieces:
 
 ## Install
 
+Grab the deb from the [Releases page](https://github.com/valeronm/sl7-sensors/releases)
+(CI builds and attaches it on every tag), or build it yourself with
+`dpkg-buildpackage -us -uc -b`.
+
 ```sh
 sudo apt install ./sl7-sensors_1.0_arm64.deb
 sudo sl7-sensors setup        # finds & mounts the Windows partition itself
