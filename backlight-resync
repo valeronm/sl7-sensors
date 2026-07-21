@@ -1,0 +1,176 @@
+#!/usr/bin/python3
+"""Refresh mutter's cached backlight value after external sysfs writes.
+
+GNOME 50 moved brightness handling into mutter (org.gnome.Mutter.DisplayConfig,
+Backlight property + SetBacklight). Mutter caches the value and — bug — never
+re-reads sysfs when someone else writes the backlight, even though the kernel
+emits udev change events and mutter has a handler for them. With the direct
+backlight controller (sensor-proxy --controller) the desktop's idea of
+brightness drifts arbitrarily far from reality: the slider lies and the
+brightness keys step from the stale value, so brightness-up can visibly DIM
+the screen.
+
+This watcher runs in the user session, polls sysfs at 1 Hz, and whenever
+the panel has diverged from mutter's cached value — including mid-ramp — it
+calls SetBacklight with the CURRENT sysfs value: value-preserving, so it
+only refreshes mutter's cache (and lets the slider track auto-brightness
+live). Mutter echoes the write back into sysfs up to ~a second stale; the
+controller recognizes any of its own recent writes (CTRL_ECHO_TICKS ring)
+and re-adopts them, so the echo is never read as user input. Harmless in
+desktop mode (mutter's own writes keep its cache correct, so no divergence
+ever shows) and on non-GNOME sessions (idles on a bus name watch).
+Self-obsoletes once mutter tracks external writes.
+"""
+import glob
+import os
+import sys
+
+import gi
+gi.require_version("Gio", "2.0")
+gi.require_version("GLib", "2.0")
+from gi.repository import Gio, GLib
+
+RESYNC_POLL_S = 1.0         # matches the controller's CTRL_USER_POLL_S
+# Divergence below this is left alone; matches the controller's
+# CTRL_STOP_COUNTS so its stop deadband can never re-trigger a sync.
+RESYNC_SLACK_COUNTS = 2
+
+MUTTER_NAME = "org.gnome.Mutter.DisplayConfig"
+MUTTER_PATH = "/org/gnome/Mutter/DisplayConfig"
+MUTTER_IFACE = "org.gnome.Mutter.DisplayConfig"
+
+
+class ResyncWatcher:
+    """Divergence detector; all I/O injected for testability.
+
+    read_brightness() -> int | None
+    get_backlight()   -> (serial, [{connector, active, min, max, value}]) | None
+    set_backlight(serial, connector, value) — raises GLib.Error on failure
+    """
+
+    def __init__(self, read_brightness, get_backlight, set_backlight,
+                 bl_max=None):
+        self.read_brightness = read_brightness
+        self.get_backlight = get_backlight
+        self.set_backlight = set_backlight
+        self.bl_max = bl_max
+        self.gave_up = None         # value whose sync failed twice: hold off
+
+    def _pick(self, entries):
+        # The internal panel: the active entry whose range matches sysfs.
+        active = [e for e in entries if e.get("active")]
+        for e in active:
+            if self.bl_max and e.get("max") == self.bl_max:
+                return e
+        return active[0] if active else None
+
+    def poll(self):
+        cur = self.read_brightness()
+        if cur is None:
+            return True
+        if cur != self.gave_up:     # a new value lifts the failure hold
+            self.gave_up = None
+        # A write to 0 is the screen blanking (DPMS/lock), not a brightness
+        # state worth teaching mutter — same rule as the controller.
+        if cur == 0 or cur == self.gave_up:
+            return True
+        # One retry: a monitor reconfig between Get and Set invalidates
+        # the serial — re-fetch and try once more.
+        for retry in (False, True):
+            state = self.get_backlight()
+            if state is None:           # mutter absent / went away mid-poll
+                return True
+            serial, entries = state
+            entry = self._pick(entries)
+            if entry is None:           # lid closed / external-only
+                return True
+            if not retry and abs(cur - entry["value"]) <= RESYNC_SLACK_COUNTS:
+                return True
+            try:
+                self.set_backlight(serial, entry["connector"], cur)
+                break
+            except GLib.Error as e:
+                if retry:
+                    print("resync: SetBacklight failed twice, holding until "
+                          f"the next change: {e}", file=sys.stderr)
+                    self.gave_up = cur
+                    return True
+        print(f"resync: mutter {entry['value']} -> {cur} "
+              f"({entry['connector']})", flush=True)
+        return True
+
+
+def main():
+    # Same device-pick policy as sensor-proxy's BacklightController: the
+    # watcher must watch the device the controller drives.
+    bl = sorted(glob.glob("/sys/class/backlight/*"))
+    if not bl:
+        print("backlight-resync: no backlight device, nothing to do",
+              flush=True)
+        return 0
+    bl_path = bl[0]
+    try:
+        with open(os.path.join(bl_path, "max_brightness")) as f:
+            bl_max = int(f.read())
+    except (OSError, ValueError):
+        bl_max = None
+
+    def read_brightness():
+        try:
+            with open(os.path.join(bl_path, "brightness")) as f:
+                return int(f.read())
+        except (OSError, ValueError):
+            return None
+
+    mutter = {"proxy": None}
+
+    # Fresh Properties.Get per candidate sync (settled + diverged is rare;
+    # a cached-property mirror would just add a staleness window).
+    def get_backlight():
+        proxy = mutter["proxy"]
+        if proxy is None:
+            return None
+        try:
+            ret = proxy.call_sync(
+                "org.freedesktop.DBus.Properties.Get",
+                GLib.Variant("(ss)", (MUTTER_IFACE, "Backlight")),
+                Gio.DBusCallFlags.NONE, 2000, None)
+        except GLib.Error:
+            return None
+        return ret.unpack()[0]
+
+    def set_backlight(serial, connector, value):
+        mutter["proxy"].call_sync(
+            "SetBacklight", GLib.Variant("(usi)", (serial, connector, value)),
+            Gio.DBusCallFlags.NONE, 2000, None)
+
+    watcher = ResyncWatcher(read_brightness, get_backlight, set_backlight,
+                            bl_max)
+    timeout = {"id": None}
+
+    def appeared(conn, name, owner):
+        mutter["proxy"] = Gio.DBusProxy.new_sync(
+            conn,
+            Gio.DBusProxyFlags.DO_NOT_LOAD_PROPERTIES
+            | Gio.DBusProxyFlags.DO_NOT_CONNECT_SIGNALS,
+            None, name, MUTTER_PATH, MUTTER_IFACE, None)
+        print(f"backlight-resync: watching {bl_path} for {name}", flush=True)
+        if timeout["id"] is None:
+            # timeout_add_seconds lets GLib coalesce the wakeup with other
+            # second-granularity timers — this process is a 1 Hz idle poll
+            timeout["id"] = GLib.timeout_add_seconds(int(RESYNC_POLL_S),
+                                                     watcher.poll)
+
+    def vanished(conn, name):
+        mutter["proxy"] = None
+        if timeout["id"] is not None:
+            GLib.source_remove(timeout["id"])
+            timeout["id"] = None
+
+    Gio.bus_watch_name(Gio.BusType.SESSION, MUTTER_NAME,
+                       Gio.BusNameWatcherFlags.NONE, appeared, vanished)
+    GLib.MainLoop().run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

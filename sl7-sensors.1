@@ -32,8 +32,16 @@ the matching per-user
 .BR gsettings (1)
 command to run afterwards.
 .TP
+.B curve
+Show the direct controller's learned lux\(->brightness calibration curve,
+plus the current light level and backlight position when available.
+Each slider or brightness-key correction adds or adjusts a point at the
+current light level; corrections are local in log-light, so a night fix
+does not re-tune daylight.
+.TP
 .B status
-Show service states, the active mode and a current sensor reading.
+Show service states (including the per-user resync watcher), the active
+mode, calibration curve size and a current sensor reading.
 .SH FILES
 .TP
 .I /var/lib/sl7-sensors/sns-config
@@ -45,6 +53,10 @@ Sensor proxy arguments; edited by
 .TP
 .I /var/lib/sl7-sensor-proxy/anchor.json
 The direct controller's calibration anchor.
+.TP
+.I /usr/lib/systemd/user/sl7-backlight-resync.service
+Per-user watcher that refreshes mutter's cached backlight value after the
+controller's external sysfs writes (GNOME 50 slider fix).
 .SH SEE ALSO
 Full documentation and caveats:
 .I /usr/share/doc/sl7-sensors/README.md.gz

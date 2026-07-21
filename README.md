@@ -55,12 +55,14 @@ GNOME 50's auto-brightness applies its smoothing on sparse D-Bus events and
 couples the slider into a second feedback anchor; in dim rooms the result
 is visibly jumpy. `--controller` mode implements the whole loop in the
 daemon instead: slow/fast dual-rate filtering of the lux stream, a
-`K·√lux` response curve, and exponential-approach backlight ramping whose
-minimum step is a single raw backlight count (imperceptible; large changes
-glide at up to 2% of range per 100 ms). The
+multi-point lux→brightness curve, and exponential-approach backlight
+ramping whose minimum step is a single raw backlight count (imperceptible;
+large changes glide at up to 2% of range per 100 ms). The
 brightness slider keeps working and *is* the calibration: set it where you
-like, and "this light ↔ this brightness" is adopted and persisted as the
-anchor.
+like, and "this light ↔ this brightness" becomes a point on the curve.
+Corrections are local in log-light — beyond ~50× the lux you corrected at,
+the curve is untouched, so a night fix never re-tunes daylight. Inspect the
+learned curve with `sl7-sensors curve`.
 
 Switch modes with the built-in command (it edits
 `/etc/default/sl7-sensor-proxy` and restarts the service; it also prints the
@@ -78,10 +80,33 @@ across switches; re-enabling picks up where you left off.
 Any external backlight write is treated as calibration — including GNOME's
 *idle dimming*, which the controller adopts and then re-adopts when
 activity restores the old level. That round trip is normally lossless, but
-if the room lighting changes while the machine sits dimmed the anchor can
+if the room lighting changes while the machine sits dimmed the curve can
 come back slightly off; disable idle dimming if you notice it
 (`gsettings set org.gnome.settings-daemon.plugins.power idle-dim false`).
 Writes of 0 (screen blanking) are never adopted.
+
+A correction takes effect on screen immediately, but is paired with the
+ambient light level only once the reading has settled (a few seconds): if
+you correct brightness right after walking into a darker or brighter spot,
+the still-moving filtered lux would otherwise be recorded and your
+correction would drift as the reading finished converging.
+
+### GNOME 50 slider fix
+
+GNOME 50 moved brightness handling into mutter, which caches the backlight
+value and — a mutter bug — never re-reads sysfs when someone else writes
+it. With the controller active the shell's idea of brightness drifts
+arbitrarily far from reality: the slider lies, and the brightness keys step
+from the stale value (brightness-up can visibly dim the screen). The
+package therefore ships a per-user `sl7-backlight-resync.service`: whenever
+the panel diverges from mutter's cache — including while a ramp is in
+progress — it refreshes the cache with a value-preserving `SetBacklight`
+call, so the slider tracks auto-brightness live and the keys always step
+from a current value. It changes nothing on screen and is invisible to the
+controller's adopt logic (the controller recognizes mutter's echo of its
+own recent writes); in desktop mode and on non-GNOME sessions it idles. It
+becomes redundant (and harmless) once mutter tracks external backlight
+writes.
 
 ## How it works / caveats
 

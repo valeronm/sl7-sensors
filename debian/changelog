@@ -1,3 +1,28 @@
+sl7-sensors (1.1.0) UNRELEASED; urgency=medium
+
+  * New per-user sl7-backlight-resync.service: GNOME 50 moved brightness
+    into mutter, whose cached Backlight value never tracks external sysfs
+    writes — with the direct controller the slider lies and brightness
+    keys step from a stale value (up can visibly dim). The watcher polls
+    sysfs and refreshes mutter's cache with a value-preserving
+    SetBacklight whenever they diverge — including mid-ramp, so the
+    slider tracks auto-brightness live (the controller recognizes the
+    echo of its own recent writes). Idles on non-GNOME sessions;
+    self-obsoletes once mutter is fixed.
+  * Controller: the single calibration anchor becomes a multi-point
+    lux->brightness curve. Slider/key corrections warp the curve locally
+    in log-light (zero effect beyond ~50x the corrected lux) and insert
+    an exact point — a night fix no longer re-tunes daylight. The old
+    anchor migrates automatically with identical behavior.
+  * Controller: deferred anchoring — a correction freezes brightness at
+    the chosen value immediately but is paired with the light level only
+    once the reading settles. Fixes corrections decaying when made just
+    after moving somewhere darker or brighter.
+  * New 'sl7-sensors curve' shows the learned calibration; status reports
+    the resync watcher and the curve point count.
+
+ -- valeronm <valeriy@hey.com>  Tue, 21 Jul 2026 22:30:00 +0100
+
 sl7-sensors (1.0.3) unstable; urgency=medium
 
   * sensor-proxy: close the SSC sensor stream across suspend. The ADSP

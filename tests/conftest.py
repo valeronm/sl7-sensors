@@ -42,3 +42,9 @@ def sp():
 @pytest.fixture(scope="session")
 def rs():
     return _load("read_sensor", "read-sensor")
+
+
+@pytest.fixture(scope="session")
+def br():
+    pytest.importorskip("gi")       # backlight-resync imports Gio/GLib too
+    return _load("backlight_resync", "backlight-resync")

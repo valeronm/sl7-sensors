@@ -20,6 +20,7 @@ gsettings set org.gnome.settings-daemon.plugins.power ambient-enabled false
 """
 import glob
 import json
+import math
 import os
 import socket
 import struct
@@ -43,9 +44,10 @@ MSGID_STREAM_CONFIG = 513
 MSGID_SENSOR_EVENT = 1025
 
 # Preferred sources, in order. The surface color sensor reports FRACTIONAL
-# lux at up to 4 Hz (its first data field), while ambient_light rounds to
-# integer lux at max 1.33 Hz — in dim rooms that quantization is a huge
-# relative jitter.
+# lux (its first data field), while ambient_light rounds to integer lux —
+# in dim rooms that quantization is a huge relative jitter. Both deliver
+# at a fixed ~1.33 Hz whatever rate is requested (measured); the 4.0 is
+# only a ceiling, accepted up to 4, refused above.
 SENSOR_SOURCES = [("color", 4.0), ("ambient_light", 1.0)]
 
 # gsd-power's own controller is too twitchy for a laptop: a 1.6 s EWMA and a
@@ -91,6 +93,29 @@ CTRL_USER_POLL_S = 1.0      # how often to look for external writes
 # Clamping the value used for anchoring AND targeting makes true darkness —
 # and a dead sensor — behave as plain manual control at the anchored level.
 CTRL_COMP_FLOOR = 1.0       # compressed-domain floor (== 1 lux at gamma 0.5)
+# Calibration is a monotone multi-point curve [[comp, frac], ...] instead of
+# a single anchor: corrections are local in log-light, so a night fix cannot
+# re-tune daylight. A correction scales the curve with a linear falloff in
+# ln(comp) distance (comp = lux**gamma halves ln-lux distances, so R=2.0
+# means influence reaches exactly zero at e**4 ≈ 55x lux; 100x = 2.30 > R).
+CTRL_WARP_RADIUS_LN = 2.0
+CTRL_MERGE_EPS_LN = 0.1     # corrections within ~1.22x lux replace a point
+                            # instead of stacking next to it (EMA jitter band)
+CTRL_MAX_POINTS = 8         # the whole comp domain spans ~4.2 ln units
+# Deferred anchoring: a correction freezes the target at the user's choice
+# immediately, but is paired with the light level only once the EMA settles —
+# anchoring against a still-falling reading decays the correction (observed:
+# every slider fix in a darkening room kept sliding back down). Counters are
+# _poll_user ticks (1 s), not wall clock, so the machine stays unit-testable.
+CTRL_SETTLE_REL = 0.05      # comp move per poll below this = stable
+CTRL_SETTLE_POLLS = 5       # consecutive stable polls before committing
+CTRL_SETTLE_MAX_POLLS = 20  # flickering light must not defer forever
+# The resync watcher calls SetBacklight mid-ramp, and mutter echoes that
+# value back into sysfs up to ~a second stale. Any value we ourselves
+# wrote within this many ticks is recognized as our own (re-adopted, keep
+# ramping) instead of being read as user input. Short enough that a real
+# key press rarely lands inside the ring; a repeat press always escapes.
+CTRL_ECHO_TICKS = 30        # 3 s of write history at the 100 ms tick
 
 BUS_NAME = "net.hadess.SensorProxy"
 OBJ_PATH = "/net/hadess/SensorProxy"
@@ -264,6 +289,139 @@ def lookup_suid(addr, data_type):
         sock.close()
 
 
+def curve_valid(pts):
+    """Validate a stored curve: a corrupt state file must not poison the
+    controller (mirrors the old anchor paranoia)."""
+    if not isinstance(pts, list) or not 0 < len(pts) <= 64:
+        return False
+    prev = 0.0
+    for p in pts:
+        if not isinstance(p, list) or len(p) != 2:
+            return False
+        x, y = p
+        for v in (x, y):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                return False
+        # NaN needs no explicit test: it fails the range checks below
+        if not (CTRL_COMP_FLOOR <= x <= 1e6) or x <= prev or not 0 < y <= 1:
+            return False
+        prev = x
+    return True
+
+
+def state_curve(state):
+    """Normalize a loaded state file to curve points, or None.
+
+    The one place that understands both formats: the current
+    {"curve": ...} and the legacy single-anchor {"k": ...}, which maps to
+    a one-point curve (the below-first-point origin ray IS k*comp). k > 1
+    is clamped: the old law already saturated the target at 1.0 there.
+    """
+    if not isinstance(state, dict):
+        return None
+    if curve_valid(state.get("curve")):
+        return [[float(x), float(y)] for x, y in state["curve"]]
+    k = state.get("k")
+    if not isinstance(k, bool) and isinstance(k, (int, float)) \
+            and 0 < k < 1e6:
+        return [[1.0, min(float(k), 1.0)]]
+    return None
+
+
+def curve_target(points, comp):
+    """Compressed light -> clamped brightness fraction: the one place the
+    floor + eval + clamp pipeline lives (daemon targeting and the
+    show-curve 'current' line must always agree)."""
+    comp = max(comp, CTRL_COMP_FLOOR)
+    return min(1.0, max(CTRL_MIN_FRAC, curve_eval(points, comp)))
+
+
+def find_backlight():
+    """The backlight device and its range; the sorted-glob-first pick
+    policy must stay matched with backlight-resync's copy (the watcher
+    has to watch the device the controller drives)."""
+    bl = sorted(glob.glob("/sys/class/backlight/*"))
+    if not bl:
+        return None, 0
+    try:
+        with open(os.path.join(bl[0], "max_brightness")) as f:
+            return bl[0], int(f.read())
+    except (OSError, ValueError):
+        return bl[0], 0
+
+
+def curve_eval(points, comp):
+    """Raw curve value at comp; the caller clamps to [CTRL_MIN_FRAC, 1.0].
+
+    Piecewise-linear between control points. Both ends extrapolate along
+    the ray from the origin through the nearest point: below, that is
+    exactly the classic k*comp law of a single anchor (migration is
+    behavior-identical); above, continuing the last SEGMENT instead would
+    let a shallow night-side segment cap daylight at night levels.
+    """
+    if comp <= points[0][0]:
+        return comp * points[0][1] / points[0][0]
+    if comp >= points[-1][0]:
+        return comp * points[-1][1] / points[-1][0]
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        if comp <= x1:
+            return y0 + (y1 - y0) * (comp - x0) / (x1 - x0)
+
+
+def curve_warp(points, comp_c, frac_c):
+    """Fold a user correction (comp_c -> frac_c) into the curve.
+
+    Short-term-model style (AOSP): scale the curve by the correction
+    factor with a linear falloff in ln(comp) distance, then insert the
+    exact point. Multiplicative, not additive — fractions span two
+    decades, and an additive night offset would double daylight while a
+    scale factor decays to a few percent. Monotonicity is repaired by
+    clamping neighbors to the inserted point (a correction that
+    contradicts a neighbor is the user's own statement about that
+    region); dropping them instead would hand the region to the origin-ray
+    extrapolation, which overshoots.
+    """
+    lc = math.log(comp_c)
+    factor = frac_c / max(curve_eval(points, comp_c), 1e-6)
+    factor = min(50.0, max(1 / 50.0, factor))
+    warped = []
+    for x, y in points:
+        d = abs(math.log(x) - lc)
+        if d < CTRL_MERGE_EPS_LN:       # merged into the new point
+            continue
+        w = max(0.0, 1.0 - d / CTRL_WARP_RADIUS_LN)
+        warped.append([x, min(1.0, max(CTRL_MIN_FRAC, y * factor ** w))])
+    new_pt = [comp_c, frac_c]           # tracked by identity below
+    idx = 0
+    while idx < len(warped) and warped[idx][0] < comp_c:
+        idx += 1
+    warped.insert(idx, new_pt)
+    for i in range(idx - 1, -1, -1):
+        warped[i][1] = min(warped[i][1], warped[i + 1][1])
+    for i in range(idx + 1, len(warped)):
+        warped[i][1] = max(warped[i][1], warped[i - 1][1])
+
+    def deviation(i):
+        (x0, y0), (x, y), (x1, y1) = warped[i - 1], warped[i], warped[i + 1]
+        return abs(y - (y0 + (y1 - y0) * (x - x0) / (x1 - x0)))
+
+    # drop interior points the interpolation already implies, then enforce
+    # the budget by dropping whoever distorts the curve least
+    i = 1
+    while i < len(warped) - 1:
+        if warped[i] is not new_pt and deviation(i) < 1e-4:
+            warped.pop(i)
+        else:
+            i += 1
+    while len(warped) > CTRL_MAX_POINTS:
+        cands = [i for i in range(1, len(warped) - 1)
+                 if warped[i] is not new_pt]
+        if not cands:
+            break
+        warped.pop(min(cands, key=deviation))
+    return warped
+
+
 class BacklightController:
     """Owns the lux -> backlight loop when --controller is active."""
 
@@ -271,15 +429,17 @@ class BacklightController:
         self.proxy = proxy
         self.enabled = False
         self.last_comp = None       # last compressed light value seen
-        bl = sorted(glob.glob("/sys/class/backlight/*"))
-        self.bl_path = bl[0] if bl else None
-        self.bl_max = int(self._read("max_brightness") or 0) if bl else 0
+        self.bl_path, self.bl_max = find_backlight()
         self.state_dir = os.environ.get("STATE_DIRECTORY",
                                         os.path.expanduser("~/.local/state"))
         self.state_file = os.path.join(self.state_dir, "anchor.json")
-        self.k = None               # anchor: brightness_frac / lux**gamma
+        self.curve = None           # calibration: [[comp, frac], ...]
         self.target = None          # fraction we're steering toward
         self.last_written = None    # raw value of our last write
+        self.tick_seq = 0
+        self.recent_writes = []     # (tick_seq, value): echo recognition
+        self.pending = None         # correction awaiting settled light:
+                                    # {frac, polls, stable, ref}
         self.writable = bool(self.bl_path) and os.access(
             os.path.join(self.bl_path, "brightness"), os.W_OK)
         self._load_state()
@@ -294,22 +454,28 @@ class BacklightController:
     def _load_state(self):
         try:
             with open(self.state_file) as f:
-                k = json.load(f)["k"]
-            # validate before adopting: a corrupt state file must not poison
-            # every subsequent on_light call
-            if isinstance(k, (int, float)) and 0 < k < 1e6 and k == k:
-                self.k = float(k)
-                print(f"controller: anchor k={self.k:.4f} loaded", flush=True)
-        except (OSError, KeyError, TypeError, ValueError):
-            # TypeError covers valid-JSON-wrong-shape (null, a list): this
-            # runs in __init__, so anything escaping restart-loops the unit
-            pass
+                state = json.load(f)
+        except (OSError, ValueError):
+            # this runs in __init__; anything escaping restart-loops the
+            # unit, and state_curve below rejects every wrong shape
+            return
+        curve = state_curve(state)
+        if curve is None:
+            return
+        self.curve = curve
+        if curve_valid(state.get("curve")):
+            print(f"controller: curve loaded, {len(curve)} point(s)",
+                  flush=True)
+        else:
+            self._save_state()          # persist: show-curve reads the file
+            print(f"controller: anchor k={state['k']:.4f} migrated to "
+                  "1-point curve", flush=True)
 
     def _save_state(self):
         try:
             os.makedirs(self.state_dir, exist_ok=True)
             with open(self.state_file, "w") as f:
-                json.dump({"k": self.k}, f)
+                json.dump({"curve": self.curve}, f)
         except OSError as e:
             print(f"controller: state save failed: {e}", file=sys.stderr)
 
@@ -327,22 +493,52 @@ class BacklightController:
     def on_light(self, compressed):
         compressed = max(compressed, CTRL_COMP_FLOOR)
         self.last_comp = compressed
-        if self.k is None:
+        if self.curve is None:
             # First contact: adopt the current brightness for current light.
             cur = int(self._read("brightness") or 0)
-            self.k = max(cur / self.bl_max, CTRL_MIN_FRAC) / compressed
+            self.curve = [[compressed, max(cur / self.bl_max,
+                                           CTRL_MIN_FRAC)]]
             self._save_state()
-            print(f"controller: initial anchor k={self.k:.4f}", flush=True)
-        self.target = min(1.0, max(CTRL_MIN_FRAC, self.k * compressed))
+            print(f"controller: seeded curve at comp={compressed:.2f} -> "
+                  f"{self.curve[0][1]:.0%}", flush=True)
+        # A pending correction freezes the target at the user's choice;
+        # retargeting resumes after the commit, which lands the curve on
+        # exactly that value at the settled comp — no jump at unfreeze.
+        if self.pending is None:
+            self.target = curve_target(self.curve, compressed)
+
+    def _record_write(self, val):
+        """Every value we put into sysfs (ramp write or adopted user
+        value) goes through here, so _is_own has one complete ledger."""
+        self.last_written = val
+        self.recent_writes.append((self.tick_seq, val))
+
+    def _is_own(self, cur):
+        """Is this sysfs value ours? The newest write matches at any age;
+        older writes only within CTRL_ECHO_TICKS — long enough for
+        mutter's ~1 s-stale echo of a resync-watcher SetBacklight, short
+        enough that a real key press rarely collides."""
+        if self.last_written is not None and abs(cur - self.last_written) <= 1:
+            return True
+        return any(abs(cur - v) <= 1 for _, v in self.recent_writes)
 
     def _tick(self):
+        self.tick_seq += 1
+        while self.recent_writes and \
+                self.recent_writes[0][0] <= self.tick_seq - CTRL_ECHO_TICKS:
+            self.recent_writes.pop(0)
         if self.target is None:
             return True
         cur = int(self._read("brightness") or 0)
-        # Someone else moved the backlight (slider, keys, idle dim): don't
-        # fight it — _poll_user will adopt it as the new anchor shortly.
         if self.last_written is not None and abs(cur - self.last_written) > 1:
-            return True
+            if self._is_own(cur):
+                # mutter's echo of one of our recent writes (the watcher
+                # syncing mid-ramp): re-adopt it and keep ramping
+                self.last_written = cur
+            else:
+                # someone else moved the backlight (slider, keys, idle
+                # dim): don't fight it — _poll_user will adopt it shortly
+                return True
         # Exponential approach in raw counts: large gaps close fast (capped at
         # CTRL_RAMP_STEP/tick), small gaps glide in 1-count steps — the largest
         # possible visible increment is 1/4095, so drift can never look like a
@@ -364,36 +560,70 @@ class BacklightController:
                     return True
             else:
                 print(f"controller[dry]: {cur} -> {val}", flush=True)
-            self.last_written = val
+            self._record_write(val)
         return True
 
     def _poll_user(self):
-        """Adopt external brightness writes (slider/keys) as the new anchor."""
+        """Adopt external brightness writes (slider/keys) as calibration.
+
+        Deferred: the write freezes the target at the user's choice right
+        away, but the curve is warped only once the light reading settles
+        (or the poll cap runs out) — see the CTRL_SETTLE_* rationale. A
+        further slider move while pending simply re-enters the detection
+        below (it is > CTRL_ADOPT_FRAC from the frozen target) and updates
+        the pending value with fresh counters.
+        """
+        if self.pending is not None:
+            self._pending_tick()
         if self.target is None:
             return True
         cur = int(self._read("brightness") or 0)
         cur_frac = cur / self.bl_max
         # Mid-ramp our own writes differ from target; only treat values that
-        # are neither our last write nor within the deadband of the target as
-        # a user decision.
-        if self.last_written is not None and abs(cur - self.last_written) <= 1:
+        # are neither our own (last write or a recent one echoed back by
+        # mutter) nor within the deadband of the target as a user decision.
+        if self._is_own(cur):
             return True
         if abs(cur_frac - self.target) < CTRL_ADOPT_FRAC:
             return True
         # A write to 0 is the screen blanking (DPMS/lock), not a brightness
-        # choice — anchoring on it would slam k to the floor. Real "as dark
-        # as possible" intent still lands: the slider's minimum is above 0.
+        # choice — anchoring on it would slam the curve to the floor. Real
+        # "as dark as possible" intent still lands: the slider's minimum is
+        # above 0.
         if cur == 0:
             return True
-        compressed = self.last_comp
-        if compressed and compressed > 0:
-            self.k = max(cur_frac, CTRL_MIN_FRAC) / compressed
-            self.target = cur_frac
-            self.last_written = cur
-            self._save_state()
-            print(f"controller: user set {cur_frac:.0%}, "
-                  f"new anchor k={self.k:.4f}", flush=True)
+        self.pending = {"frac": cur_frac, "polls": 0, "stable": 0,
+                        "ref": self.last_comp}
+        self.target = cur_frac
+        self._record_write(cur)     # ours now: a late echo of it must not
+                                    # re-enter adoption as fresh user input
+        print(f"controller: user set {cur_frac:.0%}, waiting for light "
+              "to settle", flush=True)
         return True
+
+    def _pending_tick(self):
+        p = self.pending
+        p["polls"] += 1
+        comp = self.last_comp
+        if abs(comp - p["ref"]) <= CTRL_SETTLE_REL * p["ref"]:
+            p["stable"] += 1
+        else:
+            p["stable"] = 0
+            p["ref"] = comp
+        if (p["stable"] >= CTRL_SETTLE_POLLS
+                or p["polls"] >= CTRL_SETTLE_MAX_POLLS):
+            self._commit_pending()
+
+    def _commit_pending(self):
+        # on_light always precedes a pending (nothing adopts before target
+        # exists), so curve is seeded and last_comp >= CTRL_COMP_FLOOR here
+        frac = min(1.0, max(self.pending["frac"], CTRL_MIN_FRAC))
+        self.curve = curve_warp(self.curve, self.last_comp, frac)
+        self._save_state()
+        print(f"controller: user set {frac:.0%} at "
+              f"comp={self.last_comp:.2f} (~{self.last_comp ** 2:.0f} "
+              f"lux) — curve now {len(self.curve)} point(s)", flush=True)
+        self.pending = None
 
 
 class SensorProxy:
@@ -795,9 +1025,75 @@ def set_mode(mode):
               "(known gsd-power claim bug, see README).")
 
 
+def show_curve(count_only=False):
+    """show-curve: print the learned calibration (read-only, no root —
+    the state file ships world-readable under the StateDirectory).
+    --count prints just the point count: the machine mode 'status' reads,
+    so the human table never becomes an interface."""
+    state_dir = os.environ.get("STATE_DIRECTORY", "/var/lib/sl7-sensor-proxy")
+    path = os.path.join(state_dir, "anchor.json")
+    try:
+        with open(path) as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        sys.exit("no calibration yet — the controller seeds it on first "
+                 "light reading")
+    except PermissionError:
+        sys.exit(f"cannot read {path}; try sudo")
+    except (OSError, ValueError) as e:
+        sys.exit(f"cannot read {path}: {e}")
+    pts = state_curve(state)            # legacy k renders as its 1-point curve
+    if pts is None:
+        sys.exit(f"unrecognized state in {path}")
+    if count_only:
+        print(len(pts))
+        return
+    print(f"{'lux':>8}  {'comp':>6}  brightness")
+    for x, y in pts:
+        print(f"{x * x:8.1f}  {x:6.2f}  {y:9.0%}")
+    now = current_position(pts)
+    if now:
+        print(now)
+
+
+def current_position(pts):
+    """Best-effort 'you are here' line for show-curve: the proxy's current
+    lux from the bus plus the actual backlight level. None when either
+    side is unavailable (daemon down, no backlight) — the table alone is
+    still useful then."""
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        ret = bus.call_sync(BUS_NAME, OBJ_PATH,
+                            "org.freedesktop.DBus.Properties", "Get",
+                            GLib.Variant("(ss)", (IFACE, "LightLevel")),
+                            GLib.VariantType("(v)"),
+                            Gio.DBusCallFlags.NONE, 500, None)
+        lux = float(ret.unpack()[0])
+    except GLib.Error:
+        return None
+    bl_path, bl_max = find_backlight()
+    if not bl_path or not bl_max:
+        return None
+    try:
+        with open(os.path.join(bl_path, "brightness")) as f:
+            cur = int(f.read())
+    except (OSError, ValueError):
+        return None
+    # comp derived from the published (rounded) LightLevel: can differ
+    # from the daemon's internal value by ~1% — inherent to reading over
+    # the bus, fine for display
+    comp = max(lux ** LUX_GAMMA, CTRL_COMP_FLOOR)
+    target = curve_target(pts, comp)
+    return (f"\ncurrent: {lux:.1f} lux (comp {comp:.2f}) -> curve "
+            f"{target:.0%}, backlight {cur / bl_max:.0%}")
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "set-mode":
         set_mode(sys.argv[2] if len(sys.argv) > 2 else "")
+        sys.exit(0)
+    if len(sys.argv) > 1 and sys.argv[1] == "show-curve":
+        show_curve(count_only="--count" in sys.argv)
         sys.exit(0)
     # --session: own the name on the session bus instead — lets the full
     # claim/stream path be tested unprivileged (the system-bus policy only

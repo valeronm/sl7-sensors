@@ -1,0 +1,20 @@
+[Unit]
+Description=Refresh mutter's cached backlight value after external sysfs writes
+Documentation=https://github.com/valeronm/sl7-sensors
+# GNOME 50: mutter never re-reads sysfs brightness when someone else writes
+# it, so the direct controller leaves the shell slider/keys operating from a
+# stale value. The watcher's value-preserving SetBacklight only refreshes
+# the cache; harmless in desktop mode and on non-GNOME sessions.
+# Self-obsoletes once mutter tracks external writes.
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionPathExistsGlob=/sys/class/backlight/*
+
+[Service]
+Type=exec
+ExecStart=/usr/lib/sl7-sensors/backlight-resync
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

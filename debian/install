@@ -2,8 +2,10 @@ sl7-sensors usr/bin
 setup usr/lib/sl7-sensors
 read-sensor usr/lib/sl7-sensors
 sensor-proxy usr/lib/sl7-sensors
+backlight-resync usr/lib/sl7-sensors
 sl7-sensors.service usr/lib/systemd/system
 sl7-sensor-proxy.service usr/lib/systemd/system
+sl7-backlight-resync.service usr/lib/systemd/user
 99-sl7-sensors.rules usr/lib/udev/rules.d
 default/sl7-sensor-proxy etc/default
 sl7-sensors-dbus.conf usr/share/dbus-1/system.d

@@ -11,7 +11,8 @@ Rules-Requires-Root: no
 
 Package: sl7-sensors
 Architecture: arm64
-Depends: ${shlibs:Depends}, ${misc:Depends}, python3, python3-gi
+Depends: ${shlibs:Depends}, ${misc:Depends}, python3, python3-gi,
+ init-system-helpers (>= 1.66~)
 Description: Ambient light / color sensor support for Surface Laptop 7 (X Elite)
  On Snapdragon X Elite laptops the ambient light sensor is not on any
  host-visible bus: it hangs off the Qualcomm Sensor Core (SSC) running on

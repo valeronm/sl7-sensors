@@ -16,6 +16,8 @@ usage: sl7-sensors <command>
   mode controller|desktop   choose who drives auto-brightness: this
                             package's backlight controller, or the
                             desktop's own (GNOME/KDE) — root
+  curve                     show the controller's learned lux->brightness
+                            calibration curve
   status                    show services, mode and a current reading
 
 See sl7-sensors(1) for details.
@@ -23,24 +25,29 @@ EOF
     exit "${1:-0}"
 }
 
-# unit_state <unit>: bare is-active output is poor ergonomics — "inactive"
-# for both a stopped daemon and a missing unit, "failed" with no pointer.
+# unit_state <unit> <condition-skip-msg> [--user]: bare is-active output is
+# poor ergonomics — "inactive" for both a stopped daemon and a missing unit,
+# "failed" with no pointer.
 unit_state() {
-    local load st res cond
-    load=$(systemctl show "$1.service" -p LoadState --value 2>/dev/null || true)
+    local unit=$1 skip=$2 scope=${3:-} load st res cond
+    load=$(systemctl $scope show "$unit.service" -p LoadState --value \
+        2>/dev/null || true)
     if [ "$load" != "loaded" ]; then
         echo "not installed"
         return
     fi
-    st=$(systemctl show "$1.service" -p ActiveState --value 2>/dev/null || true)
+    st=$(systemctl $scope show "$unit.service" -p ActiveState --value \
+        2>/dev/null || true)
     case "$st" in
         failed)
-            res=$(systemctl show "$1.service" -p Result --value 2>/dev/null || true)
-            echo "FAILED: ${res:-unknown} (journalctl -u $1)" ;;
+            res=$(systemctl $scope show "$unit.service" -p Result --value \
+                2>/dev/null || true)
+            echo "FAILED: ${res:-unknown} (journalctl $scope -u $unit)" ;;
         inactive)
-            cond=$(systemctl show "$1.service" -p ConditionResult --value 2>/dev/null || true)
+            cond=$(systemctl $scope show "$unit.service" -p ConditionResult \
+                --value 2>/dev/null || true)
             if [ "$cond" = no ]; then
-                echo "skipped — config not extracted (run 'sl7-sensors setup')"
+                echo "$skip"
             else
                 echo "not running"
             fi ;;
@@ -62,10 +69,23 @@ case "$cmd" in
         exec "$LIB/read-sensor" color ;;
     mode)
         exec "$LIB/sensor-proxy" set-mode "$@" ;;
+    curve)
+        exec "$LIB/sensor-proxy" show-curve ;;
     status)
+        skip="skipped — config not extracted (run 'sl7-sensors setup')"
         for unit in sl7-sensors sl7-sensor-proxy; do
-            printf '%-18s %s\n' "$unit:" "$(unit_state "$unit")"
+            printf '%-18s %s\n' "$unit:" "$(unit_state "$unit" "$skip")"
         done
+        # The resync watcher lives in the user manager: under sudo/root
+        # there is none to ask, so point at the desktop user instead.
+        if systemctl --user show-environment >/dev/null 2>&1; then
+            resync=$(unit_state sl7-backlight-resync \
+                "skipped — no backlight device" --user)
+        else
+            resync="per-user — check as your desktop user"
+            resync="$resync (systemctl --user status sl7-backlight-resync)"
+        fi
+        printf '%-18s %s\n' "resync watcher:" "$resync"
         args=$(grep '^ARGS=' "$DEFAULT" 2>/dev/null | cut -d= -f2- || true)
         if [ "$args" = "--controller" ]; then
             printf '%-18s controller (this package drives the backlight)\n' \
@@ -73,6 +93,11 @@ case "$cmd" in
         else
             printf '%-18s desktop (GNOME/KDE consumes the sensor proxy)\n' \
                 "mode:"
+        fi
+        if n=$("$LIB/sensor-proxy" show-curve --count 2>/dev/null); then
+            printf '%-18s %s point(s)\n' "curve:" "$n"
+        else
+            printf '%-18s not calibrated\n' "curve:"
         fi
         prop() {
             busctl get-property net.hadess.SensorProxy \
