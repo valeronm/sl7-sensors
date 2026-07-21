@@ -37,6 +37,20 @@ jobs:
             echo "tag $GITHUB_REF_NAME does not match changelog version $ver" >&2
             exit 1
           fi
+          if [ "$(dpkg-parsechangelog -SDistribution)" = "UNRELEASED" ]; then
+            echo "changelog still UNRELEASED — finalize (dch -r) before tagging" >&2
+            exit 1
+          fi
+
+      - name: Stamp snapshot version
+        if: github.ref_type != 'tag'
+        # Untagged builds get version X.Y.Z~git<date>.<sha>: uniquely
+        # identified, and '~' sorts before the final X.Y.Z so a test deb
+        # upgrades cleanly to the release.
+        run: |
+          ver=$(dpkg-parsechangelog -SVersion)
+          snap="$ver~git$(date -u +%Y%m%d).$(echo "$GITHUB_SHA" | cut -c1-7)"
+          sed -i "1s/($ver)/($snap)/" debian/changelog
 
       - name: Build package
         run: dpkg-buildpackage -us -uc -b
