@@ -97,6 +97,11 @@ Writes of 0 (screen blanking) are never adopted.
   the only path that bypasses the FastRPC search-path mechanism.
 - One attach per boot is enough; sensor streaming rides QMI and survives
   the daemon.
+- First diagnostic when sensors are dead: `apt install qrtr-tools` and run
+  `qrtr-lookup` — the sensor service is service **400** (`SNS_CLIENT_SVC`,
+  node 5). Absent = the DSP side never came up (re-run `sl7-sensors setup`
+  / `systemctl restart sl7-sensors`); present = the client side is at
+  fault (`sl7-sensors status`, journal).
 - GNOME's own auto-brightness maps lux to brightness linearly with **no
   minimum floor**: in a genuinely dark room it will dim the screen to
   near-black. That's upstream gsd-power behavior with any honest lux
@@ -111,6 +116,8 @@ Writes of 0 (screen blanking) are never adopted.
   (the unit itself refuses manual restart; restarting the target works).
 - Machines other than the SL7: the mechanism is generic, only the driver
   package name differs — setup searches for `*snscfg*`. Reports welcome.
+- Protocol details (QMI/TLV framing, payload layouts, recovered schemas):
+  see [`protocol/README.md`](protocol/README.md).
 
 ## License
 

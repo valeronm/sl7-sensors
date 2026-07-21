@@ -1,0 +1,13 @@
+// recovered from qcSensors.dll
+// file: sns_surface.proto
+
+message sns_surface_read_file_event {
+  required string file = 1;
+  required sfixed64 file_data = 2;
+  required sfixed64 file_length = 3;
+}
+enum sns_surface_resp {
+  SNS_SURFACE_NO_ERROR = 0;
+  SNS_SURFACE_FAILURE = 1;
+  SNS_SURFACE_CUSTOMER_MODE_ERROR = 2;
+}

@@ -1,0 +1,35 @@
+// recovered from qcSensors.dll
+// file: sns_surface_imu.proto
+
+message sns_surface_imu_vec3 {
+  required float x = 1;
+  required float y = 2;
+  required float z = 3;
+}
+message sns_surface_imu_set_cal_req {
+  required sns_surface_imu_vec3 bias = 1;
+  required sns_surface_imu_vec3 scale = 2;
+}
+message sns_surface_imu_set_cal_event {
+  required sns_surface_resp resp = 1;
+}
+message sns_surface_imu_get_cal_event {
+  required sns_surface_resp resp = 1;
+  required sns_surface_imu_vec3 bias = 2;
+  required sns_surface_imu_vec3 scale = 3;
+}
+enum sns_surface_imu_msgid {
+  SNS_SURFACE_IMU_MSGID_SNS_SURFACE_IMU_SET_CAL_REQ = 600;
+  SNS_SURFACE_IMU_MSGID_SNS_SURFACE_IMU_GET_CAL_REQ = 601;
+  SNS_SURFACE_IMU_MSGID_SNS_SURFACE_IMU_SET_CAL_EVENT = 800;
+  SNS_SURFACE_IMU_MSGID_SNS_SURFACE_IMU_GET_CAL_EVENT = 801;
+}
+enum sns_surface_imu_event_fields {
+  SNS_SURFACE_IMU_EVENT_FIELDS_X_QC = 0;
+  SNS_SURFACE_IMU_EVENT_FIELDS_Y_QC = 1;
+  SNS_SURFACE_IMU_EVENT_FIELDS_Z_QC = 2;
+  SNS_SURFACE_IMU_EVENT_FIELDS_X_RAW = 3;
+  SNS_SURFACE_IMU_EVENT_FIELDS_Y_RAW = 4;
+  SNS_SURFACE_IMU_EVENT_FIELDS_Z_RAW = 5;
+  SNS_SURFACE_IMU_EVENT_FIELDS_MAX = 6;
+}
