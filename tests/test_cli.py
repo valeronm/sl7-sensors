@@ -12,13 +12,14 @@ def run(*args):
                           capture_output=True, text=True)
 
 
-def test_no_args_is_an_error_with_usage():
+def test_no_args_is_an_error_with_usage_on_stderr():
     r = run()
     assert r.returncode == 1
-    assert "usage: sl7-sensors" in r.stdout
+    assert "usage: sl7-sensors" in r.stderr
+    assert r.stdout == ""
 
 
-def test_help_exits_zero():
+def test_help_exits_zero_on_stdout():
     for arg in ("-h", "--help", "help"):
         r = run(arg)
         assert r.returncode == 0, arg
@@ -29,3 +30,5 @@ def test_unknown_command_names_itself():
     r = run("frobnicate")
     assert r.returncode == 1
     assert "sl7-sensors: unknown command: frobnicate" in r.stderr
+    assert "usage: sl7-sensors" in r.stderr
+    assert r.stdout == ""

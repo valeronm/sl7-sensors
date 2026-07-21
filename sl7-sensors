@@ -9,7 +9,7 @@ usage() {
     cat <<'EOF'
 usage: sl7-sensors <command>
 
-  setup                     extract the sensor configuration from this
+  setup [windows-root]      extract the sensor configuration from this
                             machine's Windows partition (one-time, root)
   lux                       stream the ambient light sensor to the terminal
   color                     stream the color sensor (lux, CCT, chromaticity)
@@ -17,11 +17,39 @@ usage: sl7-sensors <command>
                             package's backlight controller, or the
                             desktop's own (GNOME/KDE) — root
   status                    show services, mode and a current reading
+
+See sl7-sensors(1) for details.
 EOF
     exit "${1:-0}"
 }
 
-[ $# -ge 1 ] || usage 1
+# unit_state <unit>: bare is-active output is poor ergonomics — "inactive"
+# for both a stopped daemon and a missing unit, "failed" with no pointer.
+unit_state() {
+    local load st res cond
+    load=$(systemctl show "$1.service" -p LoadState --value 2>/dev/null || true)
+    if [ "$load" != "loaded" ]; then
+        echo "not installed"
+        return
+    fi
+    st=$(systemctl show "$1.service" -p ActiveState --value 2>/dev/null || true)
+    case "$st" in
+        failed)
+            res=$(systemctl show "$1.service" -p Result --value 2>/dev/null || true)
+            echo "FAILED: ${res:-unknown} (journalctl -u $1)" ;;
+        inactive)
+            cond=$(systemctl show "$1.service" -p ConditionResult --value 2>/dev/null || true)
+            if [ "$cond" = no ]; then
+                echo "skipped — config not extracted (run 'sl7-sensors setup')"
+            else
+                echo "not running"
+            fi ;;
+        *)
+            echo "${st:-unknown}" ;;
+    esac
+}
+
+[ $# -ge 1 ] || usage 1 >&2
 cmd=$1; shift
 case "$cmd" in
     setup)
@@ -36,8 +64,7 @@ case "$cmd" in
         exec "$LIB/sensor-proxy" set-mode "$@" ;;
     status)
         for unit in sl7-sensors sl7-sensor-proxy; do
-            printf '%-18s %s\n' "$unit:" \
-                "$(systemctl is-active "$unit.service" 2>/dev/null || true)"
+            printf '%-18s %s\n' "$unit:" "$(unit_state "$unit")"
         done
         args=$(grep '^ARGS=' "$DEFAULT" 2>/dev/null | cut -d= -f2- || true)
         if [ "$args" = "--controller" ]; then
@@ -60,5 +87,5 @@ case "$cmd" in
     -h|--help|help)
         usage ;;
     *)
-        echo "sl7-sensors: unknown command: $cmd" >&2; usage 1 ;;
+        echo "sl7-sensors: unknown command: $cmd" >&2; usage 1 >&2 ;;
 esac

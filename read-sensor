@@ -221,7 +221,9 @@ def main():
                         # Layout (recovered empirically from sns_surface_color):
                         # lux, CCT K, CIE x, CIE y, R, G, B,
                         # raw X, Y, Z, IR, flags, atime, again
-                        f = floats
+                        # All channels are physically non-negative; tiny
+                        # negative floats would print as "-0".
+                        f = [max(v, 0.0) for v in floats]
                         vals = (f"lux={f[0]:7.1f}  cct={f[1]:5.0f}K  "
                                 f"xy=({f[2]:.3f},{f[3]:.3f})  "
                                 f"rgb=({f[4]:.0f},{f[5]:.0f},{f[6]:.0f})  "

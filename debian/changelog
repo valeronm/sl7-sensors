@@ -1,3 +1,17 @@
+sl7-sensors (1.0.2) unstable; urgency=medium
+
+  * status: oneshot-aware unit reporting — FAILED with a journalctl
+    pointer, "not installed" (LoadState), and "skipped — config not
+    extracted (run 'sl7-sensors setup')" when the start condition gated
+    the unit, instead of raw systemctl is-active output.
+  * Usage goes to stderr on error exits; mode errors carry the
+    "sl7-sensors mode: error:" prefix; usage documents setup's
+    [windows-root] argument and points at the man page.
+  * color stream: clamp channels at 0 — rounding a tiny negative float
+    printed "rgb=(3,2,-0)".
+
+ -- valeronm <valeriy@hey.com>  Mon, 20 Jul 2026 23:45:00 +0100
+
 sl7-sensors (1.0.1) unstable; urgency=medium
 
   * Test suite: 72 pytest cases — QMI/protobuf framing (with a drift guard

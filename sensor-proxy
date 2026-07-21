@@ -693,13 +693,14 @@ def set_mode(mode):
     if mode not in ("controller", "desktop"):
         sys.exit("usage: sl7-sensors mode controller|desktop")
     if os.geteuid() != 0:
-        sys.exit("mode switching must run as root (edits /etc, restarts the unit)")
+        sys.exit("sl7-sensors mode: error: must run as root "
+                 "(edits /etc, restarts the unit)")
     args = "--controller" if mode == "controller" else ""
     try:
         with open(DEFAULT_FILE) as f:
             content = f.read()
     except OSError as e:
-        sys.exit(f"cannot read {DEFAULT_FILE}: {e}")
+        sys.exit(f"sl7-sensors mode: error: cannot read {DEFAULT_FILE}: {e}")
     content, nsubs = re.subn(r"^ARGS=.*$", f"ARGS={args}", content, flags=re.M)
     if nsubs == 0:
         # ARGS line removed by hand — append rather than silently no-op
@@ -708,7 +709,7 @@ def set_mode(mode):
         with open(DEFAULT_FILE, "w") as f:
             f.write(content)
     except OSError as e:
-        sys.exit(f"cannot write {DEFAULT_FILE}: {e}")
+        sys.exit(f"sl7-sensors mode: error: cannot write {DEFAULT_FILE}: {e}")
     subprocess.run(["systemctl", "restart", "sl7-sensor-proxy.service"],
                    check=True)
     print(f"mode: {mode} — service restarted.")
