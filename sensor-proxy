@@ -409,6 +409,8 @@ class SensorProxy:
         self.claimers = {}          # sender -> (refcount, name watch id)
         self.stream_stop = None
         self.stream_thread = None
+        self.logind = None
+        self.sleep_inhibitor = None
 
     # --- D-Bus plumbing ---
 
@@ -423,6 +425,7 @@ class SensorProxy:
         self.reg_id = conn.register_object(
             OBJ_PATH, node.interfaces[0],
             self.on_method_call, self.on_get_property, None)
+        self.setup_sleep_handling()
         threading.Thread(target=self.wait_for_sensor, daemon=True).start()
 
     def on_name_lost(self, conn, name):
@@ -569,6 +572,73 @@ class SensorProxy:
             self.stream_stop.set()
         self.stream_thread = None
         self.stream_stop = None
+
+    # --- suspend/resume (logind) ---
+    # The ADSP has no idea the host is asleep: with a stream subscribed it
+    # keeps pushing indications at rate_hz, and every one is an IPCC wakeup
+    # interrupt that ends the suspend within one push interval. Hold a
+    # logind delay inhibitor so the SSC session is closed BEFORE the system
+    # sleeps, and resubscribe on resume. This must bypass the controller
+    # guard in stop_stream() — suspend outranks the controller.
+
+    def setup_sleep_handling(self):
+        try:
+            self.logind = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+            self.take_sleep_inhibitor()
+            self.logind.signal_subscribe(
+                "org.freedesktop.login1", "org.freedesktop.login1.Manager",
+                "PrepareForSleep", "/org/freedesktop/login1", None,
+                Gio.DBusSignalFlags.NONE, self.on_prepare_for_sleep, None)
+        except Exception as e:
+            # e.g. no logind (container/test session): stream just stays
+            # subscribed across sleep, as before.
+            print(f"logind sleep handling unavailable ({e!r})",
+                  file=sys.stderr)
+
+    def take_sleep_inhibitor(self):
+        if self.logind is None or self.sleep_inhibitor is not None:
+            return
+        res, fds = self.logind.call_with_unix_fd_list_sync(
+            "org.freedesktop.login1", "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager", "Inhibit",
+            GLib.Variant("(ssss)", ("sleep", "sl7-sensor-proxy",
+                                    "closing the SSC sensor stream",
+                                    "delay")),
+            GLib.VariantType("(h)"), Gio.DBusCallFlags.NONE, -1, None, None)
+        # The "(h)" reply carries a handle: an INDEX into the returned fd
+        # list, not the fd itself. UnixFDList.get() dup()s it, so the fd we
+        # store is ours to close — that close is what drops the inhibitor.
+        self.sleep_inhibitor = fds.get(res.unpack()[0])
+
+    def on_prepare_for_sleep(self, conn, sender, path, iface, signal,
+                             params, data):
+        entering = params.unpack()[0]
+        if entering:
+            self.suspend_stream()
+            if self.sleep_inhibitor is not None:
+                os.close(self.sleep_inhibitor)
+                self.sleep_inhibitor = None
+        else:
+            try:
+                self.take_sleep_inhibitor()
+            except Exception as e:
+                print(f"could not retake sleep inhibitor ({e!r})",
+                      file=sys.stderr)
+            if self.controller or self.claimers:
+                self.start_stream()
+
+    def suspend_stream(self):
+        thread = self.stream_thread
+        if self.stream_stop:
+            self.stream_stop.set()
+        self.stream_thread = None
+        self.stream_stop = None
+        if thread:
+            # The stream thread lingers in recvfrom for up to 3 s; the
+            # inhibitor's job is exactly to cover this join (logind's
+            # default delay budget is 5 s). Socket close on thread exit is
+            # what ends the SSC client session.
+            thread.join(timeout=4.0)
 
     def stream_loop(self, stop):
         # All mutable state — filter state AND the QMI address/SUID — is

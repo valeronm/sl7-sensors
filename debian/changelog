@@ -1,3 +1,13 @@
+sl7-sensors (1.0.3) unstable; urgency=medium
+
+  * sensor-proxy: close the SSC sensor stream across suspend. The ADSP
+    keeps pushing indications while the host sleeps and every one is an
+    IPCC wakeup — with the stream open, suspend dies within one push
+    interval (~250 ms at 4 Hz). Hold a logind delay inhibitor, tear the
+    stream down on PrepareForSleep (bypassing the controller guard),
+    resubscribe on resume (controller or active claims only).
+
+ -- valeronm <valeriy@hey.com>  Tue, 21 Jul 2026 18:57:34 +0100
 sl7-sensors (1.0.2) unstable; urgency=medium
 
   * status: oneshot-aware unit reporting — FAILED with a journalctl
