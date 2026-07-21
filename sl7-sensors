@@ -30,21 +30,21 @@ EOF
 # "failed" with no pointer.
 unit_state() {
     local unit=$1 skip=$2 scope=${3:-} load st res cond
-    load=$(systemctl $scope show "$unit.service" -p LoadState --value \
+    load=$(systemctl ${scope:+"$scope"} show "$unit.service" -p LoadState --value \
         2>/dev/null || true)
     if [ "$load" != "loaded" ]; then
         echo "not installed"
         return
     fi
-    st=$(systemctl $scope show "$unit.service" -p ActiveState --value \
+    st=$(systemctl ${scope:+"$scope"} show "$unit.service" -p ActiveState --value \
         2>/dev/null || true)
     case "$st" in
         failed)
-            res=$(systemctl $scope show "$unit.service" -p Result --value \
+            res=$(systemctl ${scope:+"$scope"} show "$unit.service" -p Result --value \
                 2>/dev/null || true)
             echo "FAILED: ${res:-unknown} (journalctl $scope -u $unit)" ;;
         inactive)
-            cond=$(systemctl $scope show "$unit.service" -p ConditionResult \
+            cond=$(systemctl ${scope:+"$scope"} show "$unit.service" -p ConditionResult \
                 --value 2>/dev/null || true)
             if [ "$cond" = no ]; then
                 echo "$skip"
