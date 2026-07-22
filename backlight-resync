@@ -39,6 +39,21 @@ MUTTER_NAME = "org.gnome.Mutter.DisplayConfig"
 MUTTER_PATH = "/org/gnome/Mutter/DisplayConfig"
 MUTTER_IFACE = "org.gnome.Mutter.DisplayConfig"
 
+# gsd's idle dim writes the dimmed value BENEATH the Backlight property:
+# syncing during the dim window would overwrite the shell's remembered
+# pre-dim brightness with the dim value, so the post-idle restore becomes
+# a no-op and the dim sticks (observed live). SetDimming is a write-only
+# method with no readable state, so a monitor-only connection eavesdrops
+# on the call itself and the watcher pauses while dimmed.
+DIM_MATCH = ("type='method_call',interface='org.gnome.Shell.Brightness',"
+             "member='SetDimming'")
+# The dim state is relayed to the root daemon too (system bus): the
+# controller must not adopt dim writes as calibration, and it owns the
+# restore since GNOME 50 never un-dims the backlight itself.
+PROXY_NAME = "net.hadess.SensorProxy"
+PROXY_PATH = "/net/hadess/SensorProxy"
+PROXY_DIM_IFACE = "org.sl7sensors.Controller"
+
 
 class ResyncWatcher:
     """Divergence detector; all I/O injected for testability.
@@ -54,6 +69,7 @@ class ResyncWatcher:
         self.get_backlight = get_backlight
         self.set_backlight = set_backlight
         self.bl_max = bl_max
+        self.dimmed = False         # inside an idle-dim window: see DIM_MATCH
         self.gave_up = None         # value whose sync failed twice: hold off
 
     def _pick(self, entries):
@@ -65,6 +81,8 @@ class ResyncWatcher:
         return active[0] if active else None
 
     def poll(self):
+        if self.dimmed:             # idle dim: hands off, see DIM_MATCH
+            return True
         cur = self.read_brightness()
         if cur is None:
             return True
@@ -98,6 +116,68 @@ class ResyncWatcher:
         print(f"resync: mutter {entry['value']} -> {cur} "
               f"({entry['connector']})", flush=True)
         return True
+
+
+def make_dim_hint_sender():
+    """Fire-and-forget SetDimHint relay to the root daemon; errors are
+    ignored (desktop mode, older daemon — the hint is best-effort)."""
+    try:
+        sysbus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+    except GLib.Error:
+        return lambda on: None
+
+    def send(on):
+        sysbus.call(PROXY_NAME, PROXY_PATH, PROXY_DIM_IFACE, "SetDimHint",
+                    GLib.Variant("(b)", (on,)), None,
+                    Gio.DBusCallFlags.NONE, 2000, None, None)
+    return send
+
+
+def start_dim_monitor(watcher, send_hint):
+    """Monitor-only session-bus connection watching SetDimming calls
+    (BecomeMonitor makes the connection receive-only, hence a second
+    connection). Flips watcher.dimmed; the filter runs on a GDBus worker
+    thread, which is safe for a single attribute store. Fail-open at
+    every stage — monitor unavailable (non-GNOME) or lost mid-life (bus
+    restart) means syncing unconditionally, never pausing forever."""
+    try:
+        addr = Gio.dbus_address_get_for_bus_sync(Gio.BusType.SESSION, None)
+        conn = Gio.DBusConnection.new_for_address_sync(
+            addr,
+            Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT
+            | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
+        conn.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                       "org.freedesktop.DBus.Monitoring", "BecomeMonitor",
+                       GLib.Variant("(asu)", ([DIM_MATCH], 0)),
+                       None, Gio.DBusCallFlags.NONE, 2000, None)
+    except GLib.Error as e:
+        print(f"backlight-resync: no dim monitor ({e.message}); "
+              "syncing unconditionally", file=sys.stderr)
+        return None
+
+    def on_message(connection, message, incoming):
+        # only DIM_MATCH traffic reaches a monitor connection
+        on = bool(message.get_body().unpack()[0])
+        if on != watcher.dimmed:
+            watcher.dimmed = on
+            send_hint(on)
+            print(f"backlight-resync: dim {'on' if on else 'off'}",
+                  flush=True)
+        # Consume the message: a monitor must never transmit, and letting
+        # GDBus dispatch an eavesdropped method call makes it auto-reply
+        # UnknownMethod — the bus then drops the monitor (bit us live:
+        # the first SetDimming killed the monitor 25 min after start).
+        return None
+
+    def on_closed(connection, remote_peer_vanished, error):
+        print("backlight-resync: dim monitor lost; syncing "
+              "unconditionally", file=sys.stderr)
+        watcher.dimmed = False
+        send_hint(False)            # never leave the daemon paused
+
+    conn.add_filter(on_message)
+    conn.connect("closed", on_closed)
+    return conn
 
 
 def main():
@@ -146,9 +226,16 @@ def main():
 
     watcher = ResyncWatcher(read_brightness, get_backlight, set_backlight,
                             bl_max)
+    send_hint = make_dim_hint_sender()
+    # the local ref keeps the monitor connection alive; main never returns
+    dim_conn = start_dim_monitor(watcher, send_hint)  # noqa: F841
     timeout = {"id": None}
 
     def appeared(conn, name, owner):
+        # a fresh shell starts undimmed; also recovers a missed
+        # SetDimming(false) if gnome-shell restarted mid-dim
+        watcher.dimmed = False
+        send_hint(False)
         mutter["proxy"] = Gio.DBusProxy.new_sync(
             conn,
             Gio.DBusProxyFlags.DO_NOT_LOAD_PROPERTIES

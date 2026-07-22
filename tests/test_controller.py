@@ -28,6 +28,9 @@ def ctrl(sp):
     c.tick_seq = 0
     c.recent_writes = []
     c.pending = None
+    c.dim_hint = False
+    c.dim_polls = 0
+    c.dim_restore = False
     c.writable = False              # dry run: _tick tracks last_written only
     c._save_state = lambda: None
     c.sysfs = {"brightness": 2000}
@@ -318,6 +321,59 @@ def test_write_within_deadband_of_target_ignored(ctrl):
     ctrl.sysfs["brightness"] = 2050      # mid-ramp wobble, not a decision
     ctrl._poll_user()
     assert ctrl.pending is None
+
+
+# --- dim hint: gsd's dim writes are policy, not calibration ---
+
+def test_dim_hint_pauses_adoption_and_cancels_pending(sp, ctrl):
+    start_pending(ctrl)                  # a dim write already adopted
+    ctrl.set_dim_hint(True)
+    assert ctrl.pending is None          # never committed
+    ctrl.sysfs["brightness"] = 1256      # the dim write itself
+    for _ in range(sp.CTRL_SETTLE_POLLS + 1):
+        ctrl._poll_user()
+    assert ctrl.pending is None
+    assert ctrl.curve == [[1.0, 0.25]]   # curve untouched
+
+
+def test_dim_hint_off_restores_by_ramping_back(ctrl):
+    ctrl.curve = [[1.0, 0.25]]
+    ctrl.on_light(4.0)                   # target well above the dim value
+    ctrl.last_written = 2000
+    ctrl.set_dim_hint(True)
+    ctrl.sysfs["brightness"] = 1256      # gsd dimmed; GNOME won't restore
+    ctrl.set_dim_hint(False)
+    ctrl._poll_user()                    # re-adopts the panel position
+    assert ctrl.dim_restore is False
+    assert ctrl.last_written == 1256
+    ctrl._tick()                         # and ramps back toward target
+    assert ctrl.last_written > 1256
+
+
+def test_dim_hint_off_waits_out_screen_blank(ctrl):
+    ctrl.curve = [[1.0, 0.25]]
+    ctrl.on_light(4.0)
+    ctrl.set_dim_hint(True)
+    ctrl.sysfs["brightness"] = 0         # dim then blank
+    ctrl.set_dim_hint(False)
+    ctrl._poll_user()
+    assert ctrl.dim_restore is True      # still waiting
+    ctrl.sysfs["brightness"] = 1256      # unblank
+    ctrl._poll_user()
+    assert ctrl.dim_restore is False
+    assert ctrl.last_written == 1256
+
+
+def test_dim_hint_expires_without_watcher(sp, ctrl):
+    ctrl.curve = [[1.0, 0.25]]
+    ctrl.on_light(4.0)
+    ctrl.set_dim_hint(True)
+    ctrl.sysfs["brightness"] = 1256
+    for _ in range(sp.CTRL_DIM_MAX_POLLS + 1):
+        ctrl._poll_user()
+    assert ctrl.dim_hint is False        # watchdog fired
+    ctrl._poll_user()                    # restore path runs
+    assert ctrl.last_written == 1256
 
 
 # --- state: load/save/migration; corrupt files must never poison us ---

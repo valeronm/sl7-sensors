@@ -116,6 +116,10 @@ CTRL_SETTLE_MAX_POLLS = 20  # flickering light must not defer forever
 # ramping) instead of being read as user input. Short enough that a real
 # key press rarely lands inside the ring; a repeat press always escapes.
 CTRL_ECHO_TICKS = 30        # 3 s of write history at the 100 ms tick
+# Safety cap on a watcher-relayed dim window: if the watcher dies mid-dim
+# the hint would otherwise pause adoption forever. Normal dims end in
+# minutes; after this many polls the controller restores on its own.
+CTRL_DIM_MAX_POLLS = 3600   # 1 h at the 1 s poll
 
 BUS_NAME = "net.hadess.SensorProxy"
 OBJ_PATH = "/net/hadess/SensorProxy"
@@ -137,6 +141,15 @@ INTROSPECTION = """
     <property name='LightLevel' type='d' access='read'/>
     <property name='HasProximity' type='b' access='read'/>
     <property name='ProximityNear' type='b' access='read'/>
+  </interface>
+  <interface name='org.sl7sensors.Controller'>
+    <!-- Session-side hint from the resync watcher: gsd is dimming.
+         Policy writes must not become calibration, and GNOME 50 never
+         un-dims the backlight itself, so the controller pauses adoption
+         and restores when the window ends. -->
+    <method name='SetDimHint'>
+      <arg type='b' name='dimmed' direction='in'/>
+    </method>
   </interface>
 </node>
 """
@@ -440,6 +453,9 @@ class BacklightController:
         self.recent_writes = []     # (tick_seq, value): echo recognition
         self.pending = None         # correction awaiting settled light:
                                     # {frac, polls, stable, ref}
+        self.dim_hint = False       # gsd is dimming (watcher-relayed)
+        self.dim_polls = 0
+        self.dim_restore = False    # dim ended: re-adopt panel, ramp back
         self.writable = bool(self.bl_path) and os.access(
             os.path.join(self.bl_path, "brightness"), os.W_OK)
         self._load_state()
@@ -513,6 +529,24 @@ class BacklightController:
         self.last_written = val
         self.recent_writes.append((self.tick_seq, val))
 
+    def set_dim_hint(self, on):
+        """The resync watcher saw gsd's SetDimming: the dim write is
+        policy, not calibration — pause adoption (and drop the pending it
+        may already have started). GNOME 50 never un-dims the backlight
+        itself (observed three times), so when the window ends WE restore:
+        re-adopt the panel position and let _tick ramp back to target."""
+        on = bool(on)
+        if on == self.dim_hint:
+            return
+        self.dim_hint = on
+        if on:
+            self.dim_polls = 0
+            self.pending = None
+            self.dim_restore = False
+            print("controller: dim hint on — adoption paused", flush=True)
+        else:
+            self.dim_restore = True     # at the next nonzero poll
+
     def _is_own(self, cur):
         """Is this sysfs value ours? The newest write matches at any age;
         older writes only within CTRL_ECHO_TICKS — long enough for
@@ -573,6 +607,20 @@ class BacklightController:
         below (it is > CTRL_ADOPT_FRAC from the frozen target) and updates
         the pending value with fresh counters.
         """
+        if self.dim_hint:
+            self.dim_polls += 1
+            if self.dim_polls > CTRL_DIM_MAX_POLLS:
+                print("controller: dim hint expired", flush=True)
+                self.set_dim_hint(False)
+            return True
+        if self.dim_restore:
+            # dim over; wait out any blank (0), then take the panel back
+            cur = int(self._read("brightness") or 0)
+            if cur > 0:
+                self._record_write(cur)
+                self.dim_restore = False
+                print("controller: dim over — restoring", flush=True)
+            return True
         if self.pending is not None:
             self._pending_tick()
         if self.target is None:
@@ -655,6 +703,8 @@ class SensorProxy:
         self.reg_id = conn.register_object(
             OBJ_PATH, node.interfaces[0],
             self.on_method_call, self.on_get_property, None)
+        conn.register_object(
+            OBJ_PATH, node.interfaces[1], self.on_dim_method, None, None)
         self.setup_sleep_handling()
         threading.Thread(target=self.wait_for_sensor, daemon=True).start()
 
@@ -691,6 +741,12 @@ class SensorProxy:
             self.release(sender)
         # Accelerometer/Proximity claims are accepted as no-ops: we report
         # Has*=False, but gsd should not error out if it calls them anyway.
+        invocation.return_value(None)
+
+    def on_dim_method(self, conn, sender, path, iface, method, params,
+                      invocation):
+        if method == "SetDimHint" and self.controller:
+            self.controller.set_dim_hint(params.unpack()[0])
         invocation.return_value(None)
 
     # --- claim tracking (main-loop thread only) ---

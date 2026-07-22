@@ -104,7 +104,12 @@ progress — it refreshes the cache with a value-preserving `SetBacklight`
 call, so the slider tracks auto-brightness live and the keys always step
 from a current value. It changes nothing on screen and is invisible to the
 controller's adopt logic (the controller recognizes mutter's echo of its
-own recent writes); in desktop mode and on non-GNOME sessions it idles. It
+own recent writes). During GNOME's idle-dim windows it pauses (it watches
+gsd's SetDimming calls) and relays the dim state to the controller, which
+pauses calibration too and — since GNOME 50 never un-dims the sysfs
+backlight itself — performs the restore when the window ends, ramping back
+to the light-appropriate level. In desktop mode
+and on non-GNOME sessions it idles. It
 becomes redundant (and harmless) once mutter tracks external backlight
 writes.
 

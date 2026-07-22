@@ -7,8 +7,12 @@ sl7-sensors (1.1.0) UNRELEASED; urgency=medium
     sysfs and refreshes mutter's cache with a value-preserving
     SetBacklight whenever they diverge — including mid-ramp, so the
     slider tracks auto-brightness live (the controller recognizes the
-    echo of its own recent writes). Idles on non-GNOME sessions;
-    self-obsoletes once mutter is fixed.
+    echo of its own recent writes). Watches gsd's SetDimming and relays
+    dim windows to the controller: dim writes are policy, not
+    calibration, and GNOME 50 never un-dims the sysfs backlight itself —
+    so during a dim the stack pauses, and on dim-end the controller
+    restores by ramping back to the light-appropriate level. Idles on
+    non-GNOME sessions; self-obsoletes once mutter is fixed.
   * Controller: the single calibration anchor becomes a multi-point
     lux->brightness curve. Slider/key corrections warp the curve locally
     in log-light (zero effect beyond ~50x the corrected lux) and insert

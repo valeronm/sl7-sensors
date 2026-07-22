@@ -79,6 +79,24 @@ def test_mid_ramp_syncs_every_poll(br, fx):
     assert [c[2] for c in f.calls] == [1000, 1100, 1200, 1300, 1400]
 
 
+def test_dim_window_pauses_sync(br, fx):
+    # gsd's idle dim writes beneath the Backlight property; syncing then
+    # would clobber the shell's remembered pre-dim brightness and make
+    # the dim sticky (observed live)
+    f = fx(1256, 1901)
+    f.watcher.dimmed = True
+    for _ in range(3):
+        f.watcher.poll()
+    assert f.calls == []
+    f.watcher.dimmed = False         # undim: normal syncing resumes
+    f.brightness = 1901              # (shell restored from its own memory)
+    f.watcher.poll()
+    assert f.calls == []             # no divergence left to fix
+    f.brightness = 2100              # later controller ramp diverges again
+    f.watcher.poll()
+    assert f.calls == [(2, CONNECTOR, 2100)]
+
+
 def test_zero_is_blanking_not_brightness(br, fx):
     f = fx(0, 345)
     for _ in range(3):
