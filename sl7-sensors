@@ -30,22 +30,24 @@ EOF
 # "failed" with no pointer.
 unit_state() {
     local unit=$1 skip=$2 scope=${3:-} load st res cond
-    load=$(systemctl ${scope:+"$scope"} show "$unit.service" -p LoadState --value \
-        2>/dev/null || true)
+    # the scope expansion must stay unquoted-but-guarded (SC2086); one
+    # definition so the next fix to it lands in one place
+    show() {
+        systemctl ${scope:+"$scope"} show "$unit.service" -p "$1" --value \
+            2>/dev/null || true
+    }
+    load=$(show LoadState)
     if [ "$load" != "loaded" ]; then
         echo "not installed"
         return
     fi
-    st=$(systemctl ${scope:+"$scope"} show "$unit.service" -p ActiveState --value \
-        2>/dev/null || true)
+    st=$(show ActiveState)
     case "$st" in
         failed)
-            res=$(systemctl ${scope:+"$scope"} show "$unit.service" -p Result --value \
-                2>/dev/null || true)
+            res=$(show Result)
             echo "FAILED: ${res:-unknown} (journalctl $scope -u $unit)" ;;
         inactive)
-            cond=$(systemctl ${scope:+"$scope"} show "$unit.service" -p ConditionResult \
-                --value 2>/dev/null || true)
+            cond=$(show ConditionResult)
             if [ "$cond" = no ]; then
                 echo "$skip"
             else
@@ -87,7 +89,15 @@ case "$cmd" in
         fi
         printf '%-18s %s\n' "resync watcher:" "$resync"
         args=$(grep '^ARGS=' "$DEFAULT" 2>/dev/null | cut -d= -f2- || true)
-        if [ "$args" = "--controller" ]; then
+        # EnvironmentFile syntax allows quotes and trailing spaces, so match
+        # the flag rather than the whole line: a hand-edited
+        # ARGS="--controller" used to read as desktop mode and then hide the
+        # controller-mode note on the sensor line below.
+        case "$args" in
+            *--controller*) mode=controller ;;
+            *)              mode=desktop ;;
+        esac
+        if [ "$mode" = controller ]; then
             printf '%-18s controller (this package drives the backlight)\n' \
                 "mode:"
         else
@@ -106,6 +116,12 @@ case "$cmd" in
         }
         has=$(prop HasAmbientLight) || true
         lux=$(prop LightLevel) || true
+        # Controller mode publishes HasAmbientLight=false on purpose (it
+        # is what would let a desktop claim the sensor and fight for the
+        # panel) — say so rather than looking like a dead sensor.
+        if [ "$mode" = controller ] && [ "$has" = "false" ]; then
+            has="false (hidden by controller mode)"
+        fi
         printf '%-18s %s\n' "sensor present:" "${has:-unknown}"
         printf '%-18s %s\n' "last lux:" "${lux:-n/a}"
         ;;

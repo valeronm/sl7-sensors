@@ -24,6 +24,28 @@ sl7-sensors (1.1.0) UNRELEASED; urgency=medium
     after moving somewhere darker or brighter.
   * New 'sl7-sensors curve' shows the learned calibration; status reports
     the resync watcher and the curve point count.
+  * Controller mode hides the ALS on D-Bus (HasAmbientLight=false;
+    LightLevel stays published for passive readers). That property is what
+    makes gsd-power claim the sensor and drive the panel itself — two
+    controllers on one backlight, and every gsd write reached ours as a
+    fake user correction. Now nothing else can engage, whatever any
+    desktop's ambient-enabled says.
+  * Controller: auto-brightness on the login screen, without learning
+    there. The GDM greeter ran its own gsd-power auto-brightness against
+    this proxy — it claims light and then writes the backlight itself,
+    and every one of those writes was adopted as a user correction,
+    engraving a bogus curve point on every single boot (and evicting a
+    real one). The controller now tracks logind's active session: while
+    its class is 'greeter' it still ramps (nothing else drives the panel
+    now, so the login screen finally follows the room), but it adopts
+    nothing — a calibration point means a user chose it, and there is no
+    user yet. It reclaims the panel when a user session becomes active.
+  * Controller mode no longer emits LightLevel PropertiesChanged when no
+    client has claimed: with the ALS hidden nothing subscribes, so that
+    was ~115k D-Bus signals a day to nobody. Properties.Get is unchanged.
+  * Controller: claim the panel's pre-existing brightness at first light,
+    so the level a daemon restart finds is never mistaken for a
+    correction.
 
  -- valeronm <valeriy@hey.com>  Tue, 21 Jul 2026 22:30:00 +0100
 

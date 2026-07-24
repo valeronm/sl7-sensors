@@ -1,8 +1,8 @@
 """BacklightController math: the multi-point calibration curve
 (evaluation, warping, monotone repair), the compressed-domain floor,
 exponential approach with 1-count minimum steps, and deferred adoption of
-external writes. Instances are built directly (no /sys, no state file)
-with a dict-backed fake sysfs."""
+external writes. Real instances over a dict-backed fake sysfs and a
+scratch state dir (no /sys, no D-Bus) — see the build fixture."""
 import json
 import math
 
@@ -13,28 +13,26 @@ BL_MAX = 4095
 
 
 @pytest.fixture
-def ctrl(sp):
-    c = sp.BacklightController.__new__(sp.BacklightController)
-    c.proxy = None
-    c.enabled = True
-    c.last_comp = None
-    c.bl_path = "/nonexistent"
-    c.bl_max = BL_MAX
-    c.state_dir = "/nonexistent"
-    c.state_file = "/nonexistent/anchor.json"
-    c.curve = None
-    c.target = None
-    c.last_written = None
-    c.tick_seq = 0
-    c.recent_writes = []
-    c.pending = None
-    c.dim_hint = False
-    c.dim_polls = 0
-    c.dim_restore = False
-    c.writable = False              # dry run: _tick tracks last_written only
-    c._save_state = lambda: None
+def build(sp, tmp_path, monkeypatch):
+    """Construct real BacklightControllers against a scratch state dir.
+
+    Through __init__ rather than field-by-field: the flag set keeps growing
+    (dim_hint, reclaim, greeter…) and a hand-mirrored fixture silently
+    drifts into an object shape production never has. Call it after staging
+    a state file — __init__ loads one.
+    """
+    monkeypatch.setattr(sp, "find_backlight", lambda: ("/nonexistent", BL_MAX))
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path))
+    return sp.BacklightController
+
+
+@pytest.fixture
+def ctrl(build):
+    c = build()                     # unwritable path -> dry run: _tick
+    c.enabled = True                # tracks last_written without writing
     c.sysfs = {"brightness": 2000}
     c._read = lambda attr: str(c.sysfs[attr])
+    c._save_state = lambda: None
     return c
 
 
@@ -146,6 +144,54 @@ def test_comp_floor_clamps_noise_input(sp, ctrl):
     ctrl.on_light(0.01)
     assert ctrl.last_comp == sp.CTRL_COMP_FLOOR
     assert ctrl.target == pytest.approx(0.5)
+
+
+def test_greeter_still_gets_auto_brightness(ctrl):
+    # the login screen ramps like any other screen
+    ctrl.curve = [[1.0, 0.05]]
+    ctrl.on_light(4.0)                   # target 20%, panel at 2000
+    ctrl.set_greeter(True)
+    ctrl._tick()
+    assert ctrl.last_written < 2000      # ramping down toward target
+
+
+def test_greeter_never_learns(ctrl):
+    # no user is logged in, so no write there can be a correction
+    ctrl.curve = [[1.0, 0.05]]
+    ctrl.on_light(4.0)
+    ctrl.set_greeter(True)
+    ctrl.sysfs["brightness"] = 3600      # the display manager, not a user
+    ctrl._poll_user()
+    ctrl._tick()
+    assert ctrl.pending is None          # not adopted
+    assert ctrl.last_written == 2000     # and not fought over either
+
+
+def test_user_session_reclaims_the_panel_then_adopts(ctrl):
+    ctrl.curve = [[1.0, 0.05]]
+    ctrl.on_light(4.0)
+    ctrl.set_greeter(True)
+    ctrl.sysfs["brightness"] = 3600
+    ctrl.set_greeter(False)              # login
+    ctrl._poll_user()                    # reclaims the greeter's level
+    assert ctrl.reclaim is False
+    assert ctrl.last_written == 3600
+    assert ctrl.pending is None          # reclaim is not a correction
+    ctrl.sysfs["brightness"] = 1200      # now a real key press
+    ctrl._poll_user()
+    assert ctrl.pending is not None      # adopted, not overridden
+    assert ctrl.target == pytest.approx(1200 / BL_MAX)
+
+
+def test_boot_brightness_is_not_adopted_as_user_input(ctrl):
+    # regression: on boot the panel's restored level reached _poll_user
+    # before the first ramp write and was committed as a user correction —
+    # first light must claim the pre-existing value as our own
+    ctrl.curve = [[1.0, 0.05]]           # target far below the boot level
+    ctrl.on_light(4.0)
+    ctrl._poll_user()
+    assert ctrl.pending is None
+    assert ctrl.target == pytest.approx(0.2)
 
 
 # --- _tick: the ramp ---
@@ -344,7 +390,7 @@ def test_dim_hint_off_restores_by_ramping_back(ctrl):
     ctrl.sysfs["brightness"] = 1256      # gsd dimmed; GNOME won't restore
     ctrl.set_dim_hint(False)
     ctrl._poll_user()                    # re-adopts the panel position
-    assert ctrl.dim_restore is False
+    assert ctrl.reclaim is False
     assert ctrl.last_written == 1256
     ctrl._tick()                         # and ramps back toward target
     assert ctrl.last_written > 1256
@@ -357,10 +403,10 @@ def test_dim_hint_off_waits_out_screen_blank(ctrl):
     ctrl.sysfs["brightness"] = 0         # dim then blank
     ctrl.set_dim_hint(False)
     ctrl._poll_user()
-    assert ctrl.dim_restore is True      # still waiting
+    assert ctrl.reclaim is True      # still waiting
     ctrl.sysfs["brightness"] = 1256      # unblank
     ctrl._poll_user()
-    assert ctrl.dim_restore is False
+    assert ctrl.reclaim is False
     assert ctrl.last_written == 1256
 
 
@@ -378,29 +424,24 @@ def test_dim_hint_expires_without_watcher(sp, ctrl):
 
 # --- state: load/save/migration; corrupt files must never poison us ---
 
-def load_curve(sp, tmp_path, content):
-    c = sp.BacklightController.__new__(sp.BacklightController)
-    c.curve = None
-    c.state_dir = str(tmp_path)     # legacy migration re-saves on load
-    c.state_file = str(tmp_path / "anchor.json")
-    if content is not None:
+def load_curve(build, tmp_path, content):
+    if content is not None:         # legacy migration re-saves on load
         (tmp_path / "anchor.json").write_text(content)
-    c._load_state()
-    return c.curve
+    return build().curve
 
 
-def test_load_state_migrates_legacy_anchor(sp, tmp_path):
-    assert load_curve(sp, tmp_path, json.dumps({"k": 0.5})) == [[1.0, 0.5]]
+def test_load_state_migrates_legacy_anchor(build, tmp_path):
+    assert load_curve(build, tmp_path, json.dumps({"k": 0.5})) == [[1.0, 0.5]]
 
 
-def test_load_state_clamps_oversized_legacy_anchor(sp, tmp_path):
+def test_load_state_clamps_oversized_legacy_anchor(build, tmp_path):
     # k > 1 already saturated the old law; migrate to the saturated point
-    assert load_curve(sp, tmp_path, json.dumps({"k": 5.0})) == [[1.0, 1.0]]
+    assert load_curve(build, tmp_path, json.dumps({"k": 5.0})) == [[1.0, 1.0]]
 
 
-def test_load_state_valid_curve(sp, tmp_path):
+def test_load_state_valid_curve(build, tmp_path):
     pts = [[1.0, 0.1], [4.0, 0.5], [20.0, 1.0]]
-    assert load_curve(sp, tmp_path, json.dumps({"curve": pts})) == pts
+    assert load_curve(build, tmp_path, json.dumps({"curve": pts})) == pts
 
 
 @pytest.mark.parametrize("content", [
@@ -425,19 +466,14 @@ def test_load_state_valid_curve(sp, tmp_path):
     '{"curve": [[1.0, NaN]]}',   # NaN frac
     '{"curve": %s}' % json.dumps([[float(i + 1), 1.0] for i in range(65)]),
 ])
-def test_load_state_rejects_corrupt(sp, tmp_path, content):
-    assert load_curve(sp, tmp_path, content) is None
+def test_load_state_rejects_corrupt(build, tmp_path, content):
+    assert load_curve(build, tmp_path, content) is None
 
 
-def test_state_roundtrip(sp, tmp_path):
-    c = sp.BacklightController.__new__(sp.BacklightController)
+def test_state_roundtrip(build):
+    c = build()
     c.curve = [[1.0, 0.1234], [4.0, 0.5]]
-    c.state_dir = str(tmp_path)
-    c.state_file = str(tmp_path / "anchor.json")
     c._save_state()
-    c2 = sp.BacklightController.__new__(sp.BacklightController)
-    c2.curve = None
-    c2.state_file = c.state_file
-    c2._load_state()
-    assert c2.curve == c.curve          # JSON floats roundtrip exactly
-    assert not any(math.isnan(v) for p in c2.curve for v in p)
+    reloaded = build().curve            # JSON floats roundtrip exactly
+    assert reloaded == c.curve
+    assert not any(math.isnan(v) for p in reloaded for v in p)

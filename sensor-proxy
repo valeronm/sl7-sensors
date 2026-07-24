@@ -15,8 +15,9 @@ Requires: the SSC registry populated at boot (sl7-sensors.service — run
 iio-sensor-proxy allows only root to own the name).
 
 With --controller it instead drives /sys/class/backlight directly (see
-/etc/default/sl7-sensor-proxy); disable GNOME's own auto-brightness first:
-gsettings set org.gnome.settings-daemon.plugins.power ambient-enabled false
+/etc/default/sl7-sensor-proxy) and hides the ALS on D-Bus
+(HasAmbientLight=false), so no desktop auto-brightness can claim it and
+fight for the panel. LightLevel is still published for passive readers.
 """
 import glob
 import json
@@ -74,9 +75,9 @@ EMIT_ROUND = 2          # decimals of the controller (compressed) value
 
 # --controller mode: drive /sys/class/backlight directly instead of relying
 # on gsd-power's auto-brightness (GNOME 50's controller is event-driven and
-# dual-anchored — it turns smooth input into visible jumps; disable it with
-#   gsettings set org.gnome.settings-daemon.plugins.power ambient-enabled false
-# when using this mode). Control law: brightness = K * ema_lux ** LUX_GAMMA,
+# dual-anchored — it turns smooth input into visible jumps; this mode hides
+# the ALS on the bus so gsd cannot claim it at all, see set_has_light).
+# Control law: brightness = K * ema_lux ** LUX_GAMMA,
 # where K is learned whenever the user sets brightness manually (slider,
 # keys — any external write we did not make) and persisted across restarts.
 CTRL_TICK_MS = 100          # ramp step interval
@@ -120,6 +121,20 @@ CTRL_ECHO_TICKS = 30        # 3 s of write history at the 100 ms tick
 # the hint would otherwise pause adoption forever. Normal dims end in
 # minutes; after this many polls the controller restores on its own.
 CTRL_DIM_MAX_POLLS = 3600   # 1 h at the 1 s poll
+# The login screen gets auto-brightness too — the controller ramps while a
+# display manager greeter owns the seat — but it never LEARNS there: a
+# calibration point means "the user chose this for this light", and at the
+# greeter there is no user yet. That distinction is the whole fix for the
+# curve corruption seen on every boot until 2026-07-24: the GDM greeter
+# ran its own gsd-power auto-brightness against this very proxy (claim at
+# boot+2 s, first write 1 s later), and each of those writes reached
+# _poll_user as a "user correction". Hiding the ALS in controller mode
+# (see set_has_light) stops gsd driving at all, so ramping here no longer
+# fights anyone; refusing to adopt is the belt to that braces. A timed
+# post-login grace was tried first and was strictly worse: it overrode
+# real key presses for 30 s after login (the user fights the ramp), while
+# still missing the greeter writes that do the actual damage.
+LOGIND_SEAT_PATH = "/org/freedesktop/login1/seat/seat0"
 
 BUS_NAME = "net.hadess.SensorProxy"
 OBJ_PATH = "/net/hadess/SensorProxy"
@@ -438,11 +453,13 @@ def curve_warp(points, comp_c, frac_c):
 class BacklightController:
     """Owns the lux -> backlight loop when --controller is active."""
 
-    def __init__(self, proxy):
-        self.proxy = proxy
+    def __init__(self):
         self.enabled = False
         self.last_comp = None       # last compressed light value seen
         self.bl_path, self.bl_max = find_backlight()
+        # joined once: _cur() reads this 10x a second for the life of the
+        # process, and the ramp write goes to the same path
+        self.bl_file = os.path.join(self.bl_path or "", "brightness")
         self.state_dir = os.environ.get("STATE_DIRECTORY",
                                         os.path.expanduser("~/.local/state"))
         self.state_file = os.path.join(self.state_dir, "anchor.json")
@@ -455,9 +472,11 @@ class BacklightController:
                                     # {frac, polls, stable, ref}
         self.dim_hint = False       # gsd is dimming (watcher-relayed)
         self.dim_polls = 0
-        self.dim_restore = False    # dim ended: re-adopt panel, ramp back
-        self.writable = bool(self.bl_path) and os.access(
-            os.path.join(self.bl_path, "brightness"), os.W_OK)
+        self.reclaim = False        # take the panel back at the next
+                                    # nonzero poll (dim ended, greeter left)
+        self.greeter = False        # a display manager owns the panel
+        self.writable = bool(self.bl_path) and os.access(self.bl_file,
+                                                         os.W_OK)
         self._load_state()
 
     def _read(self, attr):
@@ -466,6 +485,11 @@ class BacklightController:
                 return f.read().strip()
         except OSError:
             return None
+
+    def _cur(self):
+        """The panel's current raw level. Unreadable counts as 0, which
+        every caller already treats as 'blanked, not a brightness'."""
+        return int(self._read("brightness") or 0)
 
     def _load_state(self):
         try:
@@ -503,20 +527,32 @@ class BacklightController:
             print("controller: backlight not writable, DRY RUN", flush=True)
         self.enabled = True
         GLib.timeout_add(CTRL_TICK_MS, self._tick)
-        GLib.timeout_add(int(CTRL_USER_POLL_S * 1000), self._poll_user)
+        # seconds granularity: GLib can coalesce this wakeup with other
+        # second-aligned timers, which the 100 ms ramp tick can never be
+        GLib.timeout_add_seconds(int(CTRL_USER_POLL_S), self._poll_user)
 
     # Called on the main loop with the smoothed, gamma-compressed value.
     def on_light(self, compressed):
         compressed = max(compressed, CTRL_COMP_FLOOR)
         self.last_comp = compressed
-        if self.curve is None:
-            # First contact: adopt the current brightness for current light.
-            cur = int(self._read("brightness") or 0)
-            self.curve = [[compressed, max(cur / self.bl_max,
-                                           CTRL_MIN_FRAC)]]
-            self._save_state()
-            print(f"controller: seeded curve at comp={compressed:.2f} -> "
-                  f"{self.curve[0][1]:.0%}", flush=True)
+        if self.last_written is None:
+            # The panel's pre-existing level (boot restore, or wherever a
+            # restart left it) is state, not user intent: claim it as our
+            # own, or _poll_user can catch it between the first target and
+            # the first ramp write and commit it into the curve (observed
+            # on boot: the 90% restore adopted 1 s after first light).
+            cur = self._cur()
+            if cur > 0:
+                self._record_write(cur)
+            if self.curve is None:
+                # First contact: adopt the current brightness for current
+                # light. (An unseeded curve implies nothing was ever
+                # written, hence the nesting.)
+                self.curve = [[compressed, max(cur / self.bl_max,
+                                               CTRL_MIN_FRAC)]]
+                self._save_state()
+                print(f"controller: seeded curve at comp={compressed:.2f} "
+                      f"-> {self.curve[0][1]:.0%}", flush=True)
         # A pending correction freezes the target at the user's choice;
         # retargeting resumes after the commit, which lands the curve on
         # exactly that value at the settled comp — no jump at unfreeze.
@@ -539,13 +575,37 @@ class BacklightController:
         if on == self.dim_hint:
             return
         self.dim_hint = on
+        self._hold(on)
         if on:
             self.dim_polls = 0
-            self.pending = None
-            self.dim_restore = False
             print("controller: dim hint on — adoption paused", flush=True)
+
+    def set_greeter(self, on):
+        """The seat's active session is (or is no longer) a display
+        manager greeter. The ramp keeps running either way — the login
+        screen deserves auto-brightness — but nothing is adopted into the
+        curve while there is no user to have meant it (see
+        LOGIND_SEAT_PATH). On hand-over, take the panel back the same way
+        a dim window ends: whatever the greeter left is our baseline, not
+        a correction."""
+        on = bool(on)
+        if on == self.greeter:
+            return
+        self.greeter = on
+        self._hold(on)
+        if on:
+            print("controller: greeter session — ramping without learning",
+                  flush=True)
         else:
-            self.dim_restore = True     # at the next nonzero poll
+            print("controller: user session — taking the panel", flush=True)
+
+    def _hold(self, on):
+        """Enter or leave a window where external writes are policy rather
+        than calibration (idle dim, greeter). Entering drops any pending
+        correction; leaving schedules the reclaim that makes whatever is on
+        the panel our baseline again — see _poll_user."""
+        self.pending = None if on else self.pending
+        self.reclaim = not on           # on exit: at the next nonzero poll
 
     def _is_own(self, cur):
         """Is this sysfs value ours? The newest write matches at any age;
@@ -563,7 +623,7 @@ class BacklightController:
             self.recent_writes.pop(0)
         if self.target is None:
             return True
-        cur = int(self._read("brightness") or 0)
+        cur = self._cur()
         if self.last_written is not None and abs(cur - self.last_written) > 1:
             if self._is_own(cur):
                 # mutter's echo of one of our recent writes (the watcher
@@ -587,7 +647,7 @@ class BacklightController:
         if val != cur:
             if self.writable:
                 try:
-                    with open(os.path.join(self.bl_path, "brightness"), "w") as f:
+                    with open(self.bl_file, "w") as f:
                         f.write(str(val))
                 except OSError as e:
                     print(f"controller: write failed: {e}", file=sys.stderr)
@@ -607,25 +667,29 @@ class BacklightController:
         below (it is > CTRL_ADOPT_FRAC from the frozen target) and updates
         the pending value with fresh counters.
         """
+        if self.greeter:            # ramping, but nobody to learn from
+            return True
         if self.dim_hint:
             self.dim_polls += 1
             if self.dim_polls > CTRL_DIM_MAX_POLLS:
                 print("controller: dim hint expired", flush=True)
                 self.set_dim_hint(False)
             return True
-        if self.dim_restore:
-            # dim over; wait out any blank (0), then take the panel back
-            cur = int(self._read("brightness") or 0)
+        if self.reclaim:
+            # dim over, or the greeter handed the panel over: wait out any
+            # blank (0), then take whatever is on the panel as ours
+            cur = self._cur()
             if cur > 0:
                 self._record_write(cur)
-                self.dim_restore = False
-                print("controller: dim over — restoring", flush=True)
+                self.reclaim = False
+                print("controller: panel reclaimed — ramping to target",
+                      flush=True)
             return True
         if self.pending is not None:
             self._pending_tick()
         if self.target is None:
             return True
-        cur = int(self._read("brightness") or 0)
+        cur = self._cur()
         cur_frac = cur / self.bl_max
         # Mid-ramp our own writes differ from target; only treat values that
         # are neither our own (last write or a recent one echoed back by
@@ -700,7 +764,7 @@ class SensorProxy:
     def on_bus_acquired(self, conn, name):
         self.conn = conn
         node = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION)
-        self.reg_id = conn.register_object(
+        conn.register_object(
             OBJ_PATH, node.interfaces[0],
             self.on_method_call, self.on_get_property, None)
         conn.register_object(
@@ -832,13 +896,26 @@ class SensorProxy:
         GLib.idle_add(self.set_has_light)
 
     def set_has_light(self):
-        self.has_light = True
-        self.emit_changed({"HasAmbientLight": GLib.Variant("b", True)})
+        # HasAmbientLight is what makes gsd-power claim the sensor and run
+        # its own auto-brightness — a second controller on the same panel,
+        # whose every write reached ours as a fake user correction (the GDM
+        # greeter does exactly this: its dconf keeps ambient-enabled=true,
+        # unreachable from our package). So in controller mode the ALS
+        # stays hidden and no desktop can engage. LightLevel is still
+        # published, for passive readers like 'sl7-sensors curve'.
+        self.has_light = not self.controller
+        if self.has_light:
+            self.emit_changed({"HasAmbientLight": GLib.Variant("b", True)})
+        else:
+            print("controller mode: ALS hidden on D-Bus (nothing else "
+                  "drives the panel)", flush=True)
         # In controller mode the stream runs permanently; otherwise a client
         # may have claimed before the sensor appeared.
         if self.controller:
             self.start_stream()
             self.controller.start()
+            # the seat may have settled long before the sensor showed up
+            self.refresh_active_session()
         elif self.claimers and not self.stream_thread:
             self.start_stream()
         return False
@@ -875,6 +952,7 @@ class SensorProxy:
                 "org.freedesktop.login1", "org.freedesktop.login1.Manager",
                 "PrepareForSleep", "/org/freedesktop/login1", None,
                 Gio.DBusSignalFlags.NONE, self.on_prepare_for_sleep, None)
+            self.setup_session_handling()
         except Exception as e:
             # e.g. no logind (container/test session): stream just stays
             # subscribed across sleep, as before.
@@ -912,6 +990,73 @@ class SensorProxy:
                       file=sys.stderr)
             if self.controller or self.claimers:
                 self.start_stream()
+
+    # --- active session tracking (logind) ---
+    # Who owns the panel: while a display manager greeter is the seat's
+    # active session, the controller stands down (see LOGIND_SEAT_PATH).
+    # Watched here rather than relayed by the resync watcher because the
+    # watcher only exists once a user session is up — it cannot report on
+    # the greeter that precedes it.
+
+    def setup_session_handling(self):
+        for iface, member, path, arg0 in (
+                ("org.freedesktop.login1.Manager", "SessionNew",
+                 "/org/freedesktop/login1", None),
+                ("org.freedesktop.login1.Manager", "SessionRemoved",
+                 "/org/freedesktop/login1", None),
+                ("org.freedesktop.DBus.Properties", "PropertiesChanged",
+                 LOGIND_SEAT_PATH, "org.freedesktop.login1.Seat")):
+            self.logind.signal_subscribe(
+                "org.freedesktop.login1", iface, member, path, arg0,
+                Gio.DBusSignalFlags.NONE, self.on_session_change, None)
+        self.refresh_active_session()
+
+    def on_session_change(self, conn, sender, path, iface, signal, params,
+                          data):
+        self.refresh_active_session()
+
+    def refresh_active_session(self):
+        """seat0's active session -> its Class -> the controller. Fully
+        async (this runs off bus signals on the main loop); every failure
+        path leaves the controller active, never stood down forever.
+
+        Deliberately NOT gated on controller.enabled: the greeter's
+        SessionNew arrives ~0.3 s into boot, while the controller only
+        starts once the sensor is discovered ~2 s in — gating here dropped
+        the one signal that matters and the greeter went unnoticed."""
+        if self.controller is None:
+            return
+
+        def got_class(source, res):
+            try:
+                cls = source.call_finish(res).unpack()[0]
+            except GLib.Error:
+                cls = ""            # session vanished mid-query
+            self.controller.set_greeter(cls == "greeter")
+
+        def got_session(source, res):
+            try:
+                _sid, obj_path = source.call_finish(res).unpack()[0]
+            except GLib.Error:
+                return              # no seat0 (headless/multi-seat): as-is
+            if obj_path in ("", "/"):
+                self.controller.set_greeter(False)
+                return
+            self.logind.call(
+                "org.freedesktop.login1", obj_path,
+                "org.freedesktop.DBus.Properties", "Get",
+                GLib.Variant("(ss)", ("org.freedesktop.login1.Session",
+                                      "Class")),
+                GLib.VariantType("(v)"), Gio.DBusCallFlags.NONE, 2000, None,
+                got_class)
+
+        self.logind.call(
+            "org.freedesktop.login1", LOGIND_SEAT_PATH,
+            "org.freedesktop.DBus.Properties", "Get",
+            GLib.Variant("(ss)", ("org.freedesktop.login1.Seat",
+                                  "ActiveSession")),
+            GLib.VariantType("(v)"), Gio.DBusCallFlags.NONE, 2000, None,
+            got_session)
 
     def suspend_stream(self):
         thread = self.stream_thread
@@ -1029,8 +1174,13 @@ class SensorProxy:
         return ema, fast_since
 
     def update_light(self, value):
-        if value != self.light_level:
-            self.light_level = value
+        if value == self.light_level:
+            return
+        self.light_level = value
+        # Controller mode hides the ALS, so nothing subscribes unless a
+        # client claimed anyway — ~115k signals/day to no one otherwise.
+        # Properties.Get still serves the value (sl7-sensors curve does).
+        if self.claimers or not self.controller:
             self.emit_changed({"LightLevel": GLib.Variant("d", value)})
         return False
 
@@ -1158,7 +1308,7 @@ if __name__ == "__main__":
     bus = Gio.BusType.SESSION if "--session" in sys.argv else Gio.BusType.SYSTEM
     proxy = SensorProxy()
     if "--controller" in sys.argv:
-        proxy.controller = BacklightController(proxy)
+        proxy.controller = BacklightController()
     proxy.start(bus)
     loop = GLib.MainLoop()
     loop.run()

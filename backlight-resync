@@ -86,11 +86,12 @@ class ResyncWatcher:
         cur = self.read_brightness()
         if cur is None:
             return True
-        if cur != self.gave_up:     # a new value lifts the failure hold
-            self.gave_up = None
+        if cur == self.gave_up:     # this value failed twice: hold off
+            return True
+        self.gave_up = None         # any new value lifts the hold
         # A write to 0 is the screen blanking (DPMS/lock), not a brightness
         # state worth teaching mutter — same rule as the controller.
-        if cur == 0 or cur == self.gave_up:
+        if cur == 0:
             return True
         # One retry: a monitor reconfig between Get and Set invalidates
         # the serial — re-fetch and try once more.

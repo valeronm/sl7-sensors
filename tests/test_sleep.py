@@ -9,12 +9,10 @@ import pytest
 
 @pytest.fixture
 def proxy(sp):
-    p = sp.SensorProxy.__new__(sp.SensorProxy)
+    # __init__ does no I/O and its defaults (no logind, no suid, no
+    # claimers) are exactly what these paths need
+    p = sp.SensorProxy()
     p.controller = object()          # controller mode: stop_stream refuses
-    p.claimers = {}
-    p.logind = None
-    p.sleep_inhibitor = None
-    p.suid = None                    # keeps start_stream a no-op
     p.stream_stop = threading.Event()
     p.stream_thread = threading.Thread(target=lambda: None)
     p.stream_thread.start()

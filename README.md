@@ -64,10 +64,16 @@ Corrections are local in log-light — beyond ~50× the lux you corrected at,
 the curve is untouched, so a night fix never re-tunes daylight. Inspect the
 learned curve with `sl7-sensors curve`.
 
+Controller mode hides the sensor on D-Bus (`HasAmbientLight=false`, while
+`LightLevel` stays published for readers): that property is what makes
+gsd-power claim the sensor and drive the panel itself, and two controllers
+on one backlight fight — the GDM greeter, whose own settings this package
+cannot reach, did exactly that on every boot.
+
 Switch modes with the built-in command (it edits
 `/etc/default/sl7-sensor-proxy` and restarts the service; it also prints the
 matching per-user `gsettings` command to run — GNOME's own auto-brightness
-must be off in controller mode and on in desktop mode):
+needs to be on again in desktop mode):
 
 ```sh
 sudo sl7-sensors mode controller   # this package drives the backlight
