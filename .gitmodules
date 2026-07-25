@@ -1,3 +1,8 @@
 [submodule "fastrpc"]
 	path = fastrpc
 	url = https://github.com/quic/fastrpc.git
+	# debian/rules builds in place, so the tree fills with objects and
+	# binaries; upstream's own .gitignore misses some (test/dsp_check).
+	# Untracked content here is never ours — but a tracked modification
+	# or a moved commit still shows, which are the ones that matter.
+	ignore = untracked
