@@ -14,6 +14,10 @@ import sys
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+# installed, the scripts sit next to ssc.py in /usr/lib/sl7-sensors and
+# find it via sys.path[0]; from the tree we have to say so explicitly
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 def _load(modname, filename):
@@ -37,6 +41,12 @@ def _load(modname, filename):
 def sp():
     pytest.importorskip("gi")       # sensor-proxy imports GLib at module level
     return _load("sensor_proxy", "sensor-proxy")
+
+
+@pytest.fixture(scope="session")
+def ssc():
+    import ssc as mod                # the framing both scripts import
+    return mod
 
 
 @pytest.fixture(scope="session")

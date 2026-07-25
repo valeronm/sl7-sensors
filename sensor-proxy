@@ -33,16 +33,17 @@ gi.require_version("Gio", "2.0")
 gi.require_version("GLib", "2.0")
 from gi.repository import Gio, GLib
 
-AF_QIPCRTR = 42
-SNS_SERVICE = 400
-SNS_CLIENT_REQ = 0x20
-SNS_CLIENT_REPORT_IND = 0x21
-SNS_CLIENT_JUMBO_IND = 0x22
-SUID_LOOKUP = (0xABABABABABABABAB, 0xABABABABABABABAB)
-SNS_SUID_MSGID_REQ = 512
-SNS_SUID_MSGID_EVENT = 768
-MSGID_STREAM_CONFIG = 513
-MSGID_SENSOR_EVENT = 1025
+# The QMI/QRTR framing and the protobuf codec under it live in ssc.py,
+# installed beside this script and shared with read-sensor (they used to be
+# two copies kept in step by a test). sys.path[0] is that directory, and
+# bytecode writing is off so root never leaves __pycache__ in the libdir.
+sys.dont_write_bytecode = True
+from ssc import (                                              # noqa: E402
+    AF_QIPCRTR, MSGID_SENSOR_EVENT, MSGID_STREAM_CONFIG,
+    SNS_CLIENT_JUMBO_IND, SNS_CLIENT_REPORT_IND, SNS_CLIENT_REQ,
+    client_request, find_service, lookup_suid, pb_parse, qmi_decode,
+    qmi_encode, qmi_events, tag)
+
 
 # Preferred sources, in order. The surface color sensor reports FRACTIONAL
 # lux (its first data field), while ambient_light rounds to integer lux —
@@ -172,149 +173,6 @@ INTROSPECTION = """
 
 # ---------- minimal protobuf + QMI (see read-sensor for the annotated
 # version; framing details in worklog 2026-07-20-sl7-als-bringup) ----------
-
-def varint(n):
-    out = b""
-    while True:
-        b = n & 0x7F
-        n >>= 7
-        out += bytes([b | (0x80 if n else 0)])
-        if not n:
-            return out
-
-
-def tag(field, wire):
-    return varint(field << 3 | wire)
-
-
-def pb_bytes(field, data):
-    return tag(field, 2) + varint(len(data)) + data
-
-
-def pb_varint(field, val):
-    return tag(field, 0) + varint(val)
-
-
-def pb_fixed32(field, val):
-    return tag(field, 5) + struct.pack("<I", val)
-
-
-def pb_fixed64(field, val):
-    return tag(field, 1) + struct.pack("<Q", val)
-
-
-def read_varint(buf, i):
-    val = shift = 0
-    while i < len(buf):
-        b = buf[i]
-        i += 1
-        val |= (b & 0x7F) << shift
-        if not b & 0x80:
-            return val, i
-        shift += 7
-    return val, i
-
-
-def pb_parse(buf):
-    out, i = {}, 0
-    while i < len(buf):
-        t, i = read_varint(buf, i)
-        f, w = t >> 3, t & 7
-        if w == 0:
-            v, i = read_varint(buf, i)
-        elif w == 1:
-            v, i = buf[i:i + 8], i + 8
-        elif w == 2:
-            ln, i = read_varint(buf, i)
-            v, i = buf[i:i + ln], i + ln
-        elif w == 5:
-            v, i = buf[i:i + 4], i + 4
-        else:
-            break
-        out.setdefault(f, []).append(v)
-    return out
-
-
-def qmi_encode(msg_id, txn, payload):
-    val = struct.pack("<H", len(payload)) + payload
-    body = b"\x01" + struct.pack("<H", len(val)) + val
-    return struct.pack("<BHHH", 0, txn, msg_id, len(body)) + body
-
-
-def qmi_decode(buf):
-    if len(buf) < 7:
-        return None, None, None, {}
-    mtype, txn, msg_id, _ = struct.unpack_from("<BHHH", buf, 0)
-    tlvs, i = {}, 7
-    while i + 3 <= len(buf):
-        t, ln = buf[i], struct.unpack_from("<H", buf, i + 1)[0]
-        tlvs[t] = buf[i + 3:i + 3 + ln]
-        i += 3 + ln
-    return mtype, txn, msg_id, tlvs
-
-
-def client_request(suid, msg_id, payload=b""):
-    suid_msg = pb_fixed64(1, suid[0]) + pb_fixed64(2, suid[1])
-    susp = pb_varint(1, 1) + pb_varint(2, 0)
-    req = pb_bytes(2, payload) if payload else b""
-    return (pb_bytes(1, suid_msg) + pb_fixed32(2, msg_id) +
-            pb_bytes(3, susp) + pb_bytes(4, req))
-
-
-def qmi_events(tlvs):
-    for e in pb_parse(tlvs[2][2:]).get(2, []):
-        inner = pb_parse(e)
-        if 1 not in inner:
-            continue
-        eid = struct.unpack("<I", inner[1][0])[0]
-        yield eid, inner[3][0] if 3 in inner else b""
-
-
-def find_service():
-    s = socket.socket(AF_QIPCRTR, socket.SOCK_DGRAM, 0)
-    s.settimeout(2.0)
-    s.sendto(struct.pack("<5I", 10, 0, 0, 0, 0), (1, 0xFFFFFFFE))
-    found = None
-    while True:
-        try:
-            data, _ = s.recvfrom(4096)
-        except socket.timeout:
-            break
-        if len(data) >= 20:
-            cmd, svc, _, node, port = struct.unpack_from("<5I", data, 0)
-            if cmd == 4 and svc == SNS_SERVICE:
-                found = (node, port)
-    s.close()
-    return found
-
-
-def lookup_suid(addr, data_type):
-    sock = socket.socket(AF_QIPCRTR, socket.SOCK_DGRAM, 0)
-    sock.settimeout(3.0)
-    try:
-        req = client_request(SUID_LOOKUP, SNS_SUID_MSGID_REQ,
-                             pb_bytes(1, data_type.encode()) + pb_varint(2, 0))
-        sock.sendto(qmi_encode(SNS_CLIENT_REQ, 1, req), addr)
-        deadline = GLib.get_monotonic_time() + 6_000_000
-        while GLib.get_monotonic_time() < deadline:
-            try:
-                data, _ = sock.recvfrom(65536)
-            except socket.timeout:
-                return None
-            _, _, mid, tlvs = qmi_decode(data)
-            if mid not in (SNS_CLIENT_REPORT_IND, SNS_CLIENT_JUMBO_IND) \
-                    or 2 not in tlvs:
-                continue
-            for eid, pay in qmi_events(tlvs):
-                if eid != SNS_SUID_MSGID_EVENT:
-                    continue
-                for sb in pb_parse(pay).get(2, []):
-                    su = pb_parse(sb)
-                    return (struct.unpack("<Q", su[1][0])[0],
-                            struct.unpack("<Q", su[2][0])[0])
-        return None
-    finally:
-        sock.close()
 
 
 def curve_valid(pts):

@@ -40,6 +40,10 @@ sl7-sensors (1.1.0) UNRELEASED; urgency=medium
     now, so the login screen finally follows the room), but it adopts
     nothing — a calibration point means a user chose it, and there is no
     user yet. It reclaims the panel when a user session becomes active.
+  * The QMI/QRTR framing and its protobuf codec move to a shared ssc.py in
+    the private libdir: sensor-proxy and read-sensor each carried a copy
+    (~110 identical lines) kept in step by a test. The module stays
+    gi-free so 'sl7-sensors lux' still works without python3-gi.
   * Controller mode no longer emits LightLevel PropertiesChanged when no
     client has claimed: with the ALS hidden nothing subscribes, so that
     was ~115k D-Bus signals a day to nobody. Properties.Get is unchanged.
