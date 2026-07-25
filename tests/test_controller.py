@@ -10,6 +10,7 @@ import pytest
 
 
 BL_MAX = 4095
+CTRL_TICK_S = 0.1               # matches CTRL_TICK_MS
 
 
 @pytest.fixture
@@ -33,6 +34,16 @@ def ctrl(build):
     c.sysfs = {"brightness": 2000}
     c._read = lambda attr: str(c.sysfs[attr])
     c._save_state = lambda: None
+    # deterministic clock (the echo ring ages in wall time) and a wake
+    # recorder standing in for the GLib timer there is no main loop for
+    c.clock = 100.0
+    c._now = lambda: c.clock
+    c.wakes = 0
+
+    def wake():
+        c.wakes += 1
+        c.tick_id = 1               # armed, as GLib would leave it
+    c._wake = wake
     return c
 
 
@@ -221,13 +232,34 @@ def test_tick_backs_off_when_someone_else_moved_the_backlight(ctrl):
     ctrl.target = 1.0
     ctrl.last_written = 2082
     ctrl.sysfs["brightness"] = 3000      # slider/keys/idle-dim
-    ctrl._tick()
+    assert ctrl._tick() is False         # and stop ticking: not our panel
     assert ctrl.last_written == 2082     # no write, no fight
 
 
-def test_tick_idle_without_target(ctrl):
-    assert ctrl._tick() is True
+def test_tick_sleeps_without_target(ctrl):
+    assert ctrl._tick() is False
+    assert ctrl.tick_id is None
     assert ctrl.last_written is None
+
+
+def test_ramp_sleeps_at_target_and_new_light_wakes_it(ctrl):
+    # the 10 Hz timer was two thirds of the daemon's CPU, nearly all of it
+    # spent re-reading an unchanged file: it must run only while ramping
+    ctrl.curve = [[4.0, 2000 / BL_MAX]]
+    ctrl.on_light(4.0)                   # target is where the panel already is
+    assert ctrl._tick() is False
+    before = ctrl.wakes
+    ctrl.on_light(8.0)                   # brighter room: a new target
+    assert ctrl.wakes == before + 1
+
+
+def test_poll_wakes_the_ramp_when_our_panel_is_off_target(ctrl):
+    # backstop: whatever else fails to wake, the 1 Hz poll notices a gap
+    ctrl.curve = [[1.0, 0.05]]
+    ctrl.on_light(4.0)                   # target 20%, panel at ~49%
+    ctrl.wakes = 0
+    ctrl._poll_user()
+    assert ctrl.wakes == 1
 
 
 # --- _poll_user: deferred adoption of external writes ---
@@ -319,6 +351,7 @@ def test_own_write_is_not_adopted(ctrl):
 def ramp(ctrl, ticks):
     """Drive _tick with the fake sysfs following each write."""
     for _ in range(ticks):
+        ctrl.clock += CTRL_TICK_S
         ctrl._tick()
         if ctrl.last_written is not None:
             ctrl.sysfs["brightness"] = ctrl.last_written
@@ -343,7 +376,9 @@ def test_stale_echo_beyond_ring_is_adopted(sp, ctrl):
     ctrl.on_light(20.0)
     ramp(ctrl, 3)
     stale = ctrl.recent_writes[0][1]
-    ramp(ctrl, sp.CTRL_ECHO_TICKS + 1)          # ring expires
+    ramp(ctrl, 3)
+    ctrl.clock += sp.CTRL_ECHO_S + 1            # ring expires
+    ctrl._tick()
     ctrl.sysfs["brightness"] = stale     # too old to be our echo
     ctrl._poll_user()
     assert ctrl.pending is not None      # treated as a real user write

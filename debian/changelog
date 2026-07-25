@@ -47,6 +47,24 @@ sl7-sensors (1.1.0) UNRELEASED; urgency=medium
   * Controller mode no longer emits LightLevel PropertiesChanged when no
     client has claimed: with the ALS hidden nothing subscribes, so that
     was ~115k D-Bus signals a day to nobody. Properties.Get is unchanged.
+  * The ramp timer now runs only while there is something to ramp. At
+    10 Hz it was two thirds of the daemon's continuous CPU, spent
+    re-reading an unchanged sysfs file for the many hours a day the panel
+    already sits at target; it is re-armed by a new target or by the 1 s
+    poll noticing a gap. The echo ring ages in wall time (CTRL_ECHO_S)
+    rather than tick counts, which a stopped timer would have frozen.
+  * The lux EMA measures the interval between arrivals instead of assuming
+    the requested rate. Delivery is a fixed ~1.33 Hz however fast the DSP
+    is asked, so every time constant was about 3x longer than it claimed
+    (TAU_SLOW behaved like ~18 s), and a gap after suspend crawled out of
+    a stale value instead of re-seeding.
+  * backlight-resync: skip the mutter round-trip when sysfs still holds
+    the value mutter last took from us — that query ran every second all
+    day, waking gnome-shell each time, for a value that moves rarely. An
+    unconditional check every RESYNC_FULL_EVERY polls backstops a cache
+    we did not predict.
+  * sensor-proxy: use register_object_with_closures2 where GLib has it,
+    silencing the deprecation warning logged on every service start.
   * Controller: claim the panel's pre-existing brightness at first light,
     so the level a daemon restart finds is never mistaken for a
     correction.

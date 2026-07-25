@@ -25,13 +25,17 @@ def clock(sp, monkeypatch):
     return fake
 
 
-def feed(sp, clock, samples, rate=4.0):
-    """Run samples through the filter, returning [(ema, fast_since), ...]."""
+def feed(sp, clock, samples, rate=4.0, dt=None):
+    """Run samples through the filter, returning [(ema, fast_since), ...].
+
+    dt is the real gap between arrivals; it defaults to the requested rate
+    for tests that predate the filter measuring it.
+    """
     proxy = sp.SensorProxy()
     ema = fast_since = None
     out = []
     for lux in samples:
-        clock.now += 1.0 / rate
+        clock.now += dt if dt is not None else 1.0 / rate
         ema, fast_since = proxy.filter_sample(lux, ema, fast_since, rate)
         out.append((ema, fast_since))
     return out
@@ -81,3 +85,23 @@ def test_transient_spike_does_not_arm_fast_mode(sp, clock):
 def test_near_zero_ema_does_not_divide_by_zero(sp, clock):
     out = feed(sp, clock, [0.0, 0.5, 0.0], 4.0)
     assert all(e >= 0.0 for e, _ in out)
+
+
+def test_alpha_follows_arrival_time_not_requested_rate(sp, clock):
+    # the SSC delivers a fixed ~1.33 Hz however fast we ask, so assuming
+    # 1/rate_hz stretched every tau by ~3x (TAU_SLOW behaved like ~18 s)
+    out = feed(sp, clock, [10.0, 11.0], rate=4.0, dt=0.75)
+    measured = alphas(out, 11.0)[0]
+    assert measured == pytest.approx(0.75 / (sp.TAU_SLOW + 0.75))
+    assert measured > 0.25 / (sp.TAU_SLOW + 0.25)       # the old assumption
+
+
+def test_long_gap_reseeds_instead_of_crawling(sp, clock):
+    # resubscribe after suspend: minutes of nothing, then a reading from a
+    # room that may be entirely different — the stale EMA must not anchor it
+    proxy = sp.SensorProxy()
+    clock.now += 0.75
+    ema, fast = proxy.filter_sample(10.0, None, None, 4.0)
+    clock.now += 300.0
+    ema, _ = proxy.filter_sample(100.0, ema, fast, 4.0)
+    assert ema == pytest.approx(100.0, rel=0.05)

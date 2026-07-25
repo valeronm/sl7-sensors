@@ -24,12 +24,17 @@ class Fixture:
         self.brightness = brightness
         self.state = (2, [entry(cached)])
         self.calls = []
+        self.gets = 0               # mutter round-trips: each wakes the shell
         self.set_error = 0          # raise on this many leading set calls
         self.watcher = br.ResyncWatcher(
             lambda: self.brightness,
-            lambda: self.state,
+            self.get_backlight,
             self.set_backlight,
             bl_max=BL_MAX)
+
+    def get_backlight(self):
+        self.gets += 1
+        return self.state
 
     def set_backlight(self, serial, connector, value):
         if self.set_error > 0:
@@ -146,3 +151,44 @@ def test_double_failure_holds_until_next_change(br, fx):
     f.brightness = 2100
     f.watcher.poll()
     assert f.calls == [(2, CONNECTOR, 2100)]
+
+
+# --- querying mutter only when it can have gone stale ---
+
+def test_steady_state_stops_querying_mutter(br, fx):
+    # 86k round-trips a day, each waking gnome-shell, for a value that
+    # moves a few times: once mutter has our value, stop asking
+    f = fx(1900, 1900)
+    f.watcher.poll()
+    settled = f.gets
+    for _ in range(5):
+        f.watcher.poll()
+    assert f.gets == settled
+
+
+def test_change_in_sysfs_requeries_at_once(br, fx):
+    f = fx(1900, 1900)
+    f.watcher.poll()
+    before = f.gets
+    f.brightness = 1700             # the controller ramped
+    f.watcher.poll()
+    assert f.gets == before + 1
+    assert f.calls[-1][2] == 1700
+
+
+def test_backstop_rechecks_a_cache_we_did_not_predict(br, fx):
+    f = fx(1900, 1900)
+    f.watcher.poll()
+    before = f.gets
+    for _ in range(br.RESYNC_FULL_EVERY):
+        f.watcher.poll()
+    assert f.gets == before + 1     # one unconditional check, then quiet
+
+
+def test_new_shell_forces_a_recheck(br, fx):
+    f = fx(1900, 1900)
+    f.watcher.poll()
+    before = f.gets
+    f.watcher.synced = None         # what appeared() does on a shell restart
+    f.watcher.poll()
+    assert f.gets == before + 1

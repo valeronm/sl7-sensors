@@ -114,10 +114,12 @@ CTRL_SETTLE_POLLS = 5       # consecutive stable polls before committing
 CTRL_SETTLE_MAX_POLLS = 20  # flickering light must not defer forever
 # The resync watcher calls SetBacklight mid-ramp, and mutter echoes that
 # value back into sysfs up to ~a second stale. Any value we ourselves
-# wrote within this many ticks is recognized as our own (re-adopted, keep
+# wrote within this window is recognized as our own (re-adopted, keep
 # ramping) instead of being read as user input. Short enough that a real
 # key press rarely lands inside the ring; a repeat press always escapes.
-CTRL_ECHO_TICKS = 30        # 3 s of write history at the 100 ms tick
+# Wall time, not tick counts: the ramp timer stops when there is nothing
+# to ramp (see _sleep), so counting ticks would freeze the ring with it.
+CTRL_ECHO_S = 3.0
 # Safety cap on a watcher-relayed dim window: if the watcher dies mid-dim
 # the hint would otherwise pause adoption forever. Normal dims end in
 # minutes; after this many polls the controller restores on its own.
@@ -324,8 +326,8 @@ class BacklightController:
         self.curve = None           # calibration: [[comp, frac], ...]
         self.target = None          # fraction we're steering toward
         self.last_written = None    # raw value of our last write
-        self.tick_seq = 0
-        self.recent_writes = []     # (tick_seq, value): echo recognition
+        self.tick_id = None         # ramp timer, armed only while ramping
+        self.recent_writes = []     # (monotonic s, value): echo recognition
         self.pending = None         # correction awaiting settled light:
                                     # {frac, polls, stable, ref}
         self.dim_hint = False       # gsd is dimming (watcher-relayed)
@@ -384,10 +386,27 @@ class BacklightController:
         if not self.writable:
             print("controller: backlight not writable, DRY RUN", flush=True)
         self.enabled = True
-        GLib.timeout_add(CTRL_TICK_MS, self._tick)
+        self._wake()
         # seconds granularity: GLib can coalesce this wakeup with other
         # second-aligned timers, which the 100 ms ramp tick can never be
         GLib.timeout_add_seconds(int(CTRL_USER_POLL_S), self._poll_user)
+
+    def _now(self):
+        return GLib.get_monotonic_time() / 1e6
+
+    def _wake(self):
+        """Arm the ramp timer if it isn't running."""
+        if self.tick_id is None and self.enabled:
+            self.tick_id = GLib.timeout_add(CTRL_TICK_MS, self._tick)
+
+    def _sleep(self):
+        """Stop the ramp timer: at 10 Hz it was two thirds of this daemon's
+        CPU, spent re-reading an unchanged sysfs file for the many hours a
+        day the panel already sits at target. _wake() restarts it on a new
+        target (on_light) or a gap (_poll_user), so a missed wake costs at
+        most the 1 s until the next poll rather than a stuck backlight."""
+        self.tick_id = None
+        return False
 
     # Called on the main loop with the smoothed, gamma-compressed value.
     def on_light(self, compressed):
@@ -415,13 +434,20 @@ class BacklightController:
         # retargeting resumes after the commit, which lands the curve on
         # exactly that value at the settled comp — no jump at unfreeze.
         if self.pending is None:
-            self.target = curve_target(self.curve, compressed)
+            previous, self.target = self.target, curve_target(self.curve,
+                                                              compressed)
+            if self.target != previous:     # the light moved: ramp to it
+                self._wake()
 
     def _record_write(self, val):
         """Every value we put into sysfs (ramp write or adopted user
         value) goes through here, so _is_own has one complete ledger."""
         self.last_written = val
-        self.recent_writes.append((self.tick_seq, val))
+        self.recent_writes.append((self._now(), val))
+
+    def _prune_writes(self, now):
+        while self.recent_writes and now - self.recent_writes[0][0] > CTRL_ECHO_S:
+            self.recent_writes.pop(0)
 
     def set_dim_hint(self, on):
         """The resync watcher saw gsd's SetDimming: the dim write is
@@ -467,20 +493,17 @@ class BacklightController:
 
     def _is_own(self, cur):
         """Is this sysfs value ours? The newest write matches at any age;
-        older writes only within CTRL_ECHO_TICKS — long enough for
-        mutter's ~1 s-stale echo of a resync-watcher SetBacklight, short
-        enough that a real key press rarely collides."""
+        older writes only within CTRL_ECHO_S — long enough for mutter's
+        ~1 s-stale echo of a resync-watcher SetBacklight, short enough
+        that a real key press rarely collides."""
         if self.last_written is not None and abs(cur - self.last_written) <= 1:
             return True
         return any(abs(cur - v) <= 1 for _, v in self.recent_writes)
 
     def _tick(self):
-        self.tick_seq += 1
-        while self.recent_writes and \
-                self.recent_writes[0][0] <= self.tick_seq - CTRL_ECHO_TICKS:
-            self.recent_writes.pop(0)
+        self._prune_writes(self._now())
         if self.target is None:
-            return True
+            return self._sleep()        # nothing to steer toward yet
         cur = self._cur()
         if self.last_written is not None and abs(cur - self.last_written) > 1:
             if self._is_own(cur):
@@ -490,7 +513,8 @@ class BacklightController:
             else:
                 # someone else moved the backlight (slider, keys, idle
                 # dim): don't fight it — _poll_user will adopt it shortly
-                return True
+                # and wake us again if the panel comes back to us
+                return self._sleep()
         # Exponential approach in raw counts: large gaps close fast (capped at
         # CTRL_RAMP_STEP/tick), small gaps glide in 1-count steps — the largest
         # possible visible increment is 1/4095, so drift can never look like a
@@ -498,7 +522,7 @@ class BacklightController:
         # drift into visible notches (measured: 60-count jumps once a second).
         delta_counts = self.target * self.bl_max - cur
         if abs(delta_counts) < CTRL_STOP_COUNTS:
-            return True
+            return self._sleep()        # arrived; idle until light moves
         step = max(1.0, min(abs(delta_counts) * CTRL_APPROACH,
                             CTRL_RAMP_STEP * self.bl_max))
         val = cur + int(round(step)) * (1 if delta_counts > 0 else -1)
@@ -509,7 +533,7 @@ class BacklightController:
                         f.write(str(val))
                 except OSError as e:
                     print(f"controller: write failed: {e}", file=sys.stderr)
-                    return True
+                    return self._sleep()    # /sys gone: stop spinning on it
             else:
                 print(f"controller[dry]: {cur} -> {val}", flush=True)
             self._record_write(val)
@@ -525,6 +549,7 @@ class BacklightController:
         below (it is > CTRL_ADOPT_FRAC from the frozen target) and updates
         the pending value with fresh counters.
         """
+        self._prune_writes(self._now())     # the ramp timer may be asleep
         if self.greeter:            # ramping, but nobody to learn from
             return True
         if self.dim_hint:
@@ -540,6 +565,7 @@ class BacklightController:
             if cur > 0:
                 self._record_write(cur)
                 self.reclaim = False
+                self._wake()
                 print("controller: panel reclaimed — ramping to target",
                       flush=True)
             return True
@@ -553,6 +579,10 @@ class BacklightController:
         # are neither our own (last write or a recent one echoed back by
         # mutter) nor within the deadband of the target as a user decision.
         if self._is_own(cur):
+            # ours, so nothing to adopt — but if it is off target the ramp
+            # belongs running: the backstop for any wake path missed above
+            if abs(self.target * self.bl_max - cur) >= CTRL_STOP_COUNTS:
+                self._wake()
             return True
         if abs(cur_frac - self.target) < CTRL_ADOPT_FRAC:
             return True
@@ -605,6 +635,7 @@ class SensorProxy:
         self.has_light = False
         self.light_level = 0.0
         self.rate_hz = 1.0
+        self.last_sample_t = None   # arrival clock: the EMA's real dt
         self.controller = None
         self.claimers = {}          # sender -> (refcount, name watch id)
         self.stream_stop = None
@@ -622,11 +653,17 @@ class SensorProxy:
     def on_bus_acquired(self, conn, name):
         self.conn = conn
         node = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION)
-        conn.register_object(
-            OBJ_PATH, node.interfaces[0],
-            self.on_method_call, self.on_get_property, None)
-        conn.register_object(
-            OBJ_PATH, node.interfaces[1], self.on_dim_method, None, None)
+        # What Python calls register_object is the closure-based
+        # registration, which GLib 2.84 deprecated in favour of
+        # ...with_closures2 (corrected marshalling of the property
+        # closures' return values). getattr keeps older GLib working
+        # without a versioned python3-gi dependency in debian/control.
+        register = getattr(conn, "register_object_with_closures2",
+                           conn.register_object)
+        register(OBJ_PATH, node.interfaces[0],
+                 self.on_method_call, self.on_get_property, None)
+        register(OBJ_PATH, node.interfaces[1],
+                 self.on_dim_method, None, None)
         self.setup_sleep_handling()
         threading.Thread(target=self.wait_for_sensor, daemon=True).start()
 
@@ -1008,6 +1045,7 @@ class SensorProxy:
     def filter_sample(self, lux, ema, fast_since, rate_hz):
         """Runs on the stream thread; returns updated (ema, fast_since)."""
         now = GLib.get_monotonic_time() / 1e6
+        prev, self.last_sample_t = self.last_sample_t, now
         if ema is None:
             ema = lux
         else:
@@ -1019,7 +1057,15 @@ class SensorProxy:
                 fast_since = None
             fast = fast_since is not None and now - fast_since >= FAST_HOLD_S
             tau = TAU_FAST if fast else TAU_SLOW
-            dt = 1.0 / rate_hz
+            # Measured, not assumed. Delivery is a fixed ~1.33 Hz whatever
+            # rate the DSP accepted, so 1/rate_hz (0.25 s at the requested
+            # 4 Hz) made every tau about 3x longer than it claims — TAU_SLOW
+            # was really ~18 s. rate_hz is only the seed for the first gap.
+            # A real gap (dropped sample, resubscribe after suspend) now
+            # catches up in proportion, which is the point of a time
+            # constant: after minutes away the EMA re-seeds on arrival
+            # rather than crawling out of a stale value.
+            dt = now - prev if prev is not None else 1.0 / rate_hz
             ema += (dt / (tau + dt)) * (lux - ema)
 
         # D-Bus carries TRUE lux (the SensorProxy contract; KDE and scripts

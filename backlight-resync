@@ -34,6 +34,14 @@ RESYNC_POLL_S = 1.0         # matches the controller's CTRL_USER_POLL_S
 # Divergence below this is left alone; matches the controller's
 # CTRL_STOP_COUNTS so its stop deadband can never re-trigger a sync.
 RESYNC_SLACK_COUNTS = 2
+# Asking mutter for its cached value costs a blocking round-trip and wakes
+# gnome-shell, and the panel is unchanged the overwhelming majority of the
+# day — so a poll that finds sysfs still at the value we last handed over
+# skips the query entirely. Mutter can only move its own cache by writing
+# sysfs (slider, keys), which changes what we read, so this cannot miss a
+# real divergence; the periodic full check below is purely a backstop for
+# a cache we did not predict (monitor reconfig, a mutter we mispredicted).
+RESYNC_FULL_EVERY = 30      # polls (~30 s) between unconditional checks
 
 MUTTER_NAME = "org.gnome.Mutter.DisplayConfig"
 MUTTER_PATH = "/org/gnome/Mutter/DisplayConfig"
@@ -71,6 +79,8 @@ class ResyncWatcher:
         self.bl_max = bl_max
         self.dimmed = False         # inside an idle-dim window: see DIM_MATCH
         self.gave_up = None         # value whose sync failed twice: hold off
+        self.synced = None          # sysfs value mutter last took from us
+        self.polls_since_check = 0  # see RESYNC_FULL_EVERY
 
     def _pick(self, entries):
         # The internal panel: the active entry whose range matches sysfs.
@@ -93,6 +103,12 @@ class ResyncWatcher:
         # state worth teaching mutter — same rule as the controller.
         if cur == 0:
             return True
+        # Nothing has moved since mutter took this value from us: no query
+        # (see RESYNC_FULL_EVERY), except once every so often as a backstop.
+        self.polls_since_check += 1
+        if cur == self.synced and self.polls_since_check < RESYNC_FULL_EVERY:
+            return True
+        self.polls_since_check = 0
         # One retry: a monitor reconfig between Get and Set invalidates
         # the serial — re-fetch and try once more.
         for retry in (False, True):
@@ -104,6 +120,7 @@ class ResyncWatcher:
             if entry is None:           # lid closed / external-only
                 return True
             if not retry and abs(cur - entry["value"]) <= RESYNC_SLACK_COUNTS:
+                self.synced = cur       # mutter already agrees
                 return True
             try:
                 self.set_backlight(serial, entry["connector"], cur)
@@ -114,6 +131,7 @@ class ResyncWatcher:
                           f"the next change: {e}", file=sys.stderr)
                     self.gave_up = cur
                     return True
+        self.synced = cur
         print(f"resync: mutter {entry['value']} -> {cur} "
               f"({entry['connector']})", flush=True)
         return True
@@ -236,6 +254,7 @@ def main():
         # a fresh shell starts undimmed; also recovers a missed
         # SetDimming(false) if gnome-shell restarted mid-dim
         watcher.dimmed = False
+        watcher.synced = None       # new shell, unknown cache: re-check
         send_hint(False)
         mutter["proxy"] = Gio.DBusProxy.new_sync(
             conn,
