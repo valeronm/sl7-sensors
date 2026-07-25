@@ -127,10 +127,11 @@ CTRL_DIM_MAX_POLLS = 3600   # 1 h at the 1 s poll
 # The login screen gets auto-brightness too — the controller ramps while a
 # display manager greeter owns the seat — but it never LEARNS there: a
 # calibration point means "the user chose this for this light", and at the
-# greeter there is no user yet. That distinction is the whole fix for the
-# curve corruption seen on every boot until 2026-07-24: the GDM greeter
-# ran its own gsd-power auto-brightness against this very proxy (claim at
-# boot+2 s, first write 1 s later), and each of those writes reached
+# greeter there is no user yet. That distinction is the whole fix for a
+# curve corrupted on every boot: the GDM greeter runs its own gsd-power
+# auto-brightness against this very proxy (claim at boot+2 s, first write
+# 1 s later — its dconf profile still has ambient-enabled=true, and a
+# system package cannot reach it), and each of those writes reached
 # _poll_user as a "user correction". Hiding the ALS in controller mode
 # (see set_has_light) stops gsd driving at all, so ramping here no longer
 # fights anyone; refusing to adopt is the belt to that braces. A timed
@@ -173,8 +174,7 @@ INTROSPECTION = """
 """
 
 
-# ---------- minimal protobuf + QMI (see read-sensor for the annotated
-# version; framing details in worklog 2026-07-20-sl7-als-bringup) ----------
+# ---------- calibration curve: storage, evaluation, correction ----------
 
 
 def curve_valid(pts):
